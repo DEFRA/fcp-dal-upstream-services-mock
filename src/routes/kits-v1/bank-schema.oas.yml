@@ -1,0 +1,708 @@
+openapi: 3.1.0
+info:
+  title: Bank Change Service API
+  description: API for submitting bank details for a business
+  version: '1.0.0'
+  license:
+    name: 'Open Government Licence v3.0'
+    url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3'
+tags:
+  - name: 'bank'
+    description: API for submitting bank details
+security:
+  - mTLS: []
+servers:
+  - url: 'https://chs-upgrade-api.ruraldev.org.uk:8446/extapi'
+    description: The test server for KITS/V1 APIs
+paths:
+  /bank-change-service/v1/submit:
+    post:
+      tags:
+        - 'bank'
+      summary: Submits bank change, to be sent to Azure Service Bus
+      operationId: submitBankChange
+      requestBody:
+        required: true
+        description: Bank change request data
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmissionRequest'
+            examples:
+              BankChangeRequest:
+                summary: A bank change request
+                description: Bank change request
+                value:
+                  sbi: '822222222'
+                  frn: '9222222222'
+                  crn: '9222222000'
+                  submissionDateTime: 02/05/2026 14:12:11
+                  account:
+                    accountType: UK_BUSINESS
+                    name: John Doe
+                    number: '14345678'
+                    iban: PT392831273127334616
+                    buildingSocietyRollNumber: '2123414'
+                    bank:
+                      name: t1est
+                      sortCode: '123456'
+                      swiftCode: '8741136'
+                  country:
+                    code: IRL
+                    currency: EUR
+                  organisationId: '2222222222' # sfd-id-check: allow - organisation ID
+                  personId: '22222220'
+      responses:
+        '200':
+          description: Change processed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                ChangeProcessed:
+                  summary: The bank change has been processed
+                  description: Change processed
+                  value: {}
+        '400':
+          description: field validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+        '500':
+          description: There was an unexpected service error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+
+  /bank-change-service/v1/locked-status/{organisationId}/{personId}:
+    get:
+      tags:
+        - 'bank'
+      summary: Whether a user/organisation pair is locked for bank-change attempts
+      operationId: getLockedStatus
+      parameters:
+        - name: organisationId
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: personId
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        '200':
+          description: Locked status retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LockedStatusResponse'
+              examples:
+                Unlocked:
+                  summary: Pair is not locked
+                  value:
+                    locked: false
+                Locked:
+                  summary: Pair is locked (failed attempts within last 24h)
+                  value:
+                    locked: true
+        '400':
+          description: field validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+        '403':
+          description: >
+            Upstream WAF rejects requests whose path contains characters its
+            administrative rules disallow (e.g. fuzzed binary segments).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: >
+            Upstream returns 404 when a path segment resolves to an
+            empty/invalid value (e.g. control-character segments).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+
+  /bank-change-service/v1/account-status/{organisationId}:
+    get:
+      tags:
+        - 'bank'
+      summary: Returns whether an organisation's bank details are editable
+      operationId: getAccountStatus
+      parameters:
+        - name: organisationId
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        '200':
+          description: Account status retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountStatusResponse'
+              examples:
+                Editable:
+                  summary: Bank details can be edited
+                  value:
+                    editable: true
+                    submitted: false
+                    updatedRecently: false
+                    new: false
+                NotEditable:
+                  summary: Bank details cannot be edited (recently submitted)
+                  value:
+                    editable: false
+                    submitted: true
+                    updatedRecently: true
+                    new: false
+        '400':
+          description: field validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+        '403':
+          description: >
+            Upstream WAF rejects requests whose path contains characters its
+            administrative rules disallow (e.g. fuzzed binary segments).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: >
+            Upstream returns 404 when the path resolves to an empty/invalid
+            organisationId (e.g. control-character segments).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+        '500':
+          description: >
+            Upstream incorrectly returns 500 (instead of 400) for invalid organisationId values — e.g. `00`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+
+  /bank-change-service/v1/country-codes:
+    get:
+      tags:
+        - 'bank'
+      summary: Country code to currency mapping for bank-change payments
+      description: >
+        Returns the mapping of country codes to their payment currency.
+      operationId: getCountryAndCurrency
+      responses:
+        '200':
+          description: Country/currency mapping retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountriesCurrencyResponse'
+              examples:
+                CountriesCurrency:
+                  summary: A map of country codes to currency codes
+                  value:
+                    countriesCurrency:
+                      GB: GBP
+                      IE: EUR
+                      PT: EUR
+                      US: USD
+        '403':
+          description: >
+            Upstream WAF rejects the request (e.g. an administrative rule has been
+            triggered).
+          content:
+            text/html:
+              schema:
+                type: string
+        '500':
+          description: There was an unexpected service error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountriesCurrencyResponse'
+
+  /bank-change-service/v1/existing-accounts/{frn}:
+    get:
+      tags:
+        - 'bank'
+      summary: Returns the bank accounts held in DAX for an FRN (last 4 digits and currency)
+      operationId: getExistingAccounts
+      parameters:
+        - name: frn
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        '200':
+          description: Existing accounts retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExistingAccountsResponse'
+              examples:
+                Accounts:
+                  summary: A list of accounts existing in DAX
+                  value:
+                    accounts:
+                      - number: '1234'
+                        currency: EUR
+                      - number: '5678'
+                        currency: GBP
+                NoAccounts:
+                  summary: No accounts held in DAX for this FRN
+                  value:
+                    accounts: []
+        '400':
+          description: field validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+        '403':
+          description: >
+            Upstream WAF rejects requests whose path segment its administrative
+            rules disallow (e.g. non-numeric or 11+ digit values).
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: >
+            Upstream returns 404 when the path resolves to an empty/invalid
+            frn (e.g. control-character segments).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+        '500':
+          description: There was an unexpected service error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+
+  /bank-change-service/v1/validate:
+    post:
+      tags:
+        - 'bank'
+      summary: Validate bank details against the payment system before submission
+      operationId: validateBankChange
+      requestBody:
+        required: true
+        description: Bank change validation request data
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidateRequest'
+            examples:
+              ValidateRequest:
+                summary: A bank validation request
+                value:
+                  sbi: '822222222'
+                  frn: '9222222222'
+                  crn: '9222222000'
+                  dateOfBirth: 21/04/2000
+                  submissionDateTime: 02/05/2026 14:12:11
+                  account:
+                    accountType: UK_BUSINESS
+                    name: Jane Doe
+                    number: '12345678'
+                    bank:
+                      name: Acme Bank
+                      sortCode: '000000'
+                  country:
+                    code: GB
+                    currency: GBP
+      responses:
+        '200':
+          description: Validation completed (success, partial match, or failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidateResponse'
+              examples:
+                Match:
+                  summary: Details fully matched
+                  value:
+                    status: MATCH
+                    message: All good
+                    attemptsRemaining: 0
+                    account:
+                      bank:
+                        name: Acme Bank
+                        sortCode: '000000'
+                PartialMatch:
+                  summary: Details partially matched
+                  value:
+                    status: PARTIAL_MATCH
+                    message: Some details did not match — please confirm
+                    attemptsRemaining: 0
+                    account:
+                      bank:
+                        name: Acme Bank
+                        sortCode: '000000'
+                Failed:
+                  summary: Details did not match
+                  value:
+                    status: FAILED
+                    message: Details don't match
+                    attemptsRemaining: 2
+                    account:
+                      bank:
+                        sortCode: '000000'
+        '400':
+          description: field validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+        '500':
+          description: >
+            Upstream incorrectly returns 500 (instead of 400) for invalid payloads
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  timestamp:
+                    type: string
+                  status:
+                    type: integer
+                  error:
+                    type: string
+                  path:
+                    type: string
+
+components:
+  securitySchemes:
+    mTLS:
+      type: mutualTLS
+      description: >
+        Mutual TLS authentication. Client must present a certificate issued by the server.
+  schemas:
+    SubmissionBankDetails:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+          description: Bank name. Must not be blank — upstream returns code:20 400 if missing/empty.
+        sortCode:
+          type: [string, number, boolean, 'null']
+          description: >
+            UK 6-digit sort code. Optional at submission, but required downstream for
+            UK_PERSONAL/UK_BUSINESS accounts.
+        swiftCode:
+          type: [string, number, boolean, 'null']
+          description: >
+            SWIFT/BIC code. Optional at submission, but required downstream for EU accounts.
+    SubmissionAccountDetails:
+      type: object
+      required:
+        - accountType
+        - name
+        - bank
+        - number
+      properties:
+        accountType:
+          type: [string, integer]
+          enum:
+            - EU
+            - UK_PERSONAL
+            - UK_BUSINESS
+            - 0
+            - 1
+            - 2
+          description: Account classification. Must not be null.
+        name:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+          description: Account holder name. Must not be blank.
+        number:
+          oneOf:
+            - type: string
+              minLength: 4
+            - type: number
+              minimum: 1000
+            - type: boolean
+          description: UK account number (typically 8 digits). Must be at least 4 chars.
+        iban:
+          type: [string, number, boolean, 'null']
+          description: International Bank Account Number for EU/international accounts.
+        buildingSocietyRollNumber:
+          type: [string, number, boolean, 'null']
+          description: >
+            Optional building society roll number. Note: upstream applies no server-side
+            validation restricting this field to building-society account types — it's
+            accepted and passed through regardless of accountType.
+        bank:
+          $ref: '#/components/schemas/SubmissionBankDetails'
+    CountryDetails:
+      type: object
+      required:
+        - currency
+      properties:
+        code:
+          type: [string, number, boolean, 'null']
+        currency:
+          type: [string, integer]
+          enum:
+            - EUR
+            - GBP
+            - 0
+            - 1
+          description: Currency code.
+    SubmissionRequest:
+      type: object
+      examples:
+        - organisationId: '1000000000' # sfd-id-check: allow - organisation ID
+          personId: '1000000000' # sfd-id-check: allow - person ID
+          sbi: '800000000'
+          frn: '9000000000'
+          crn: '9000000000'
+          submissionDateTime: '01/02/2023 14:12:11'
+          account:
+            accountType: UK_BUSINESS
+            name: John Doe
+            number: '12345678'
+            bank:
+              name: Acme Bank
+              sortCode: '123456'
+          country:
+            code: GB
+            currency: GBP
+      required:
+        - organisationId
+        - personId
+        - sbi
+        - frn
+        - crn
+        - submissionDateTime
+        - account
+        - country
+      properties:
+        organisationId:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+          description: >
+            Internal organisation ID. Numeric string parseable as Long. Must not be blank —
+            upstream returns code:20 400 if missing/empty; non-numeric values cause HTTP 500.
+        personId:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+          description: Internal person ID. Numeric string parseable as Long. Must not be blank.
+        sbi:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+          description: Single Business Identifier. Must not be blank.
+        frn:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+          description: Firm Reference Number. Must not be blank.
+        crn:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+          description: Customer Reference Number. Must not be blank.
+        submissionDateTime:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+          example: '01/02/2023 14:12:11'
+        account:
+          $ref: '#/components/schemas/SubmissionAccountDetails'
+        country:
+          $ref: '#/components/schemas/CountryDetails'
+    ValidateRequest:
+      type: object
+      examples:
+        - sbi: '800000000'
+          frn: '9000000000'
+          crn: '9000000000'
+          dateOfBirth: '21/04/2000'
+          submissionDateTime: '01/02/2023 14:12:11'
+          account:
+            accountType: UK_BUSINESS
+            name: John Doe
+            number: '12345678'
+            bank:
+              name: Acme Bank
+              sortCode: '123456'
+          country:
+            code: GB
+            currency: GBP
+      required:
+        - sbi
+        - frn
+        - crn
+        - submissionDateTime
+        - account
+        - country
+      properties:
+        sbi:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+        frn:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+        crn:
+          type: [string, number, boolean]
+          minLength: 1
+          pattern: '[^\s\u001C-\u001F]'
+        dateOfBirth:
+          type: [string, number, boolean, 'null']
+          description: Optional date of birth (dd/MM/yyyy).
+        submissionDateTime:
+          type: [string, number, boolean]
+          minLength: 1
+          example: '01/02/2023 14:12:11'
+        account:
+          $ref: '#/components/schemas/SubmissionAccountDetails'
+        country:
+          $ref: '#/components/schemas/CountryDetails'
+    ValidateAccountResult:
+      type: object
+      properties:
+        iban:
+          type: [string, 'null']
+        bank:
+          type: object
+          properties:
+            name:
+              type: [string, 'null']
+            sortCode:
+              type: [string, 'null']
+            swiftCode:
+              type: [string, 'null']
+    ValidateResponse:
+      type: object
+      required:
+        - status
+        - message
+        - attemptsRemaining
+        - account
+      properties:
+        status:
+          type: string
+          enum:
+            - MATCH
+            - PARTIAL_MATCH
+            - FAILED
+        message:
+          type: string
+        attemptsRemaining:
+          type: integer
+          minimum: 0
+        account:
+          $ref: '#/components/schemas/ValidateAccountResult'
+    LockedStatusResponse:
+      type: object
+      required:
+        - locked
+      properties:
+        locked:
+          type: boolean
+          description: >
+            Whether the user/organisation pair is locked from bank-change attempts.
+            Upstream returns a JSON boolean (the Jira description's stringified form
+            was inaccurate — confirmed against the live API).
+    AccountStatusResponse:
+      type: object
+      required:
+        - editable
+        - submitted
+        - updatedRecently
+        - new
+      properties:
+        editable:
+          type: boolean
+          description: True only when neither `new` nor `submitted` is true.
+        submitted:
+          type: boolean
+          description: Bank details passed validation and were submitted in the last 14 days.
+        updatedRecently:
+          type: boolean
+          description: Bank details were updated (or attempted) in the last 14 days.
+        new:
+          type: boolean
+          description: Organisation created within the last 24 hours.
+    CountriesCurrencyResponse:
+      type: object
+      properties:
+        countriesCurrency:
+          type: object
+          additionalProperties:
+            type: string
+          description: >
+            Map of country code to the currency code used for payments to that
+            country (e.g. GB maps to GBP, IE maps to EUR).
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+    ExistingAccount:
+      type: object
+      properties:
+        number:
+          type: [string, 'null']
+          description: Last 4 digits of the account number held in DAX.
+        currency:
+          type: [string, 'null']
+          description: Currency of the account (e.g. EUR, GBP).
+    ExistingAccountsResponse:
+      type: object
+      properties:
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExistingAccount'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+    ResponseError:
+      type: object
+      properties:
+        code:
+          type: integer
+        description:
+          type: string
+    DefaultResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'

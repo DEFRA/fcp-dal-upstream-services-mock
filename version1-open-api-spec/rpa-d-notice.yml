@@ -1,0 +1,429 @@
+openapi: '3.0.1'
+info:
+  title: D-Notice (Feature Toggle) Service
+  version: v1
+  x-source-repository: d-notice
+  description: |
+    Dropwizard/Hibernate/Jersey service managing **feature toggles** ("d-notices") for
+    the CAPD Rural Payments portal.
+
+    **Purpose**: Provides a centralised store of named boolean feature flags that control
+    which features are visible or enabled across the portal. Toggles are persisted in an
+    Oracle database and cached in an in-memory cache.
+
+    **Database**: `CAPD_DNOTICE.feature_toggle` (Oracle)
+    - `name` VARCHAR (primary key, unlimited length)
+    - `description` VARCHAR(60), NOT NULL
+    - `live` BOOLEAN, NOT NULL
+    - `defaultValue` BOOLEAN, NOT NULL
+
+    **Audit**: Table is audited with Hibernate Envers (`@Audited`).
+
+    **Response envelope**: All successful JSON responses are wrapped in a `CapdResponse`
+    envelope with a single `_data` field containing the payload (see `CapdResponse` schema).
+
+    **Toggle name validation**: All `{name}` path parameters MUST be a member of the
+    `FeatureToggleNames` enum (string values listed in `Toggle.name` description). Any
+    unrecognised name returns HTTP 400.
+
+    **Authentication**: No authentication scheme. Internal service only — accessible only
+    within the CAPD private network.
+
+    **Bulk update 404 body**: When `PUT /d-notice/bulkUpdate` returns 404, the body is the
+    raw `BulkUpdateResult` JSON (NOT wrapped in `CapdResponse`).
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: d-notice
+    description: Feature toggle management
+  - name: version
+    description: Application version check
+
+paths:
+  /d-notice/all/db:
+    get:
+      tags:
+        - d-notice
+      summary: Get all toggles from the database
+      operationId: getAllTogglesFromDB
+      description: |
+        Queries `CAPD_DNOTICE.feature_toggle` for all rows and returns them as a
+        `CapdResponse<Map<String, Toggle>>`.
+
+        **HTTP 404**: No rows found in the database table (logs at CRITICAL severity).
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      responses:
+        '200':
+          description: |
+            Map of all toggles. Keys are toggle `name` values. Wrapped in `CapdResponse._data`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseToggleMap'
+        '404':
+          description: No toggles exist in the database
+
+  /d-notice/all/cache:
+    get:
+      tags:
+        - d-notice
+      summary: Get all toggles from the in-memory cache
+      operationId: getAllTogglesFromCache
+      description: |
+        Returns all toggles currently held in the in-memory cache.
+
+        **HTTP 404**: Cache is empty (no toggles loaded).
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      responses:
+        '200':
+          description: |
+            Map of all cached toggles. Keys are toggle `name` values. Wrapped in
+            `CapdResponse._data`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseToggleMap'
+        '404':
+          description: No toggles in cache
+
+  /d-notice/reload/{name}:
+    get:
+      tags:
+        - d-notice
+      summary: Reload a specific toggle from database into cache
+      operationId: reloadSpecificToggle
+      description: |
+        Clears the specific toggle from the cache, queries the database by toggle
+        `name`, and if found, saves it back to the cache.
+
+        **Toggle name validation**: `name` MUST be a recognised `FeatureToggleNames` enum
+        value (e.g., `apply-for-bps`). Unrecognised names → HTTP 400.
+
+        **HTTP 400**: `name` is not a valid `FeatureToggleNames` value.
+        **HTTP 404**: Toggle name is valid but not found in the database.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: name
+          in: path
+          required: true
+          description: |
+            Feature toggle name. Must be a recognised `FeatureToggleNames` value.
+            See `Toggle.name` schema for the full list of known values.
+          schema:
+            type: string
+          example: apply-for-bps
+      responses:
+        '200':
+          description: Toggle found and reloaded. Wrapped in `CapdResponse._data`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseToggle'
+        '400':
+          description: Toggle name not recognised (not in FeatureToggleNames enum)
+        '404':
+          description: Toggle not found in database
+
+  /d-notice/{name}:
+    get:
+      tags:
+        - d-notice
+      summary: Get a specific toggle from database by name
+      operationId: getSpecificToggle
+      description: |
+        Fetches a single toggle from `CAPD_DNOTICE.feature_toggle` by name. Does NOT
+        update the cache.
+
+        **Toggle name validation**: `name` MUST be a recognised `FeatureToggleNames` enum
+        value. Unrecognised names → HTTP 400.
+
+        **HTTP 400**: `name` is not a valid `FeatureToggleNames` value.
+        **HTTP 404**: Toggle name is valid but not found in the database.
+
+        **Note**: JAX-RS path `/d-notice/reload/{name}` is matched before
+        `/d-notice/{name}`, so `reload` is NOT treated as a toggle name here.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: name
+          in: path
+          required: true
+          description: |
+            Feature toggle name. Must be a recognised `FeatureToggleNames` value.
+          schema:
+            type: string
+          example: apply-for-bps
+      responses:
+        '200':
+          description: Toggle found. Wrapped in `CapdResponse._data`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseToggle'
+        '400':
+          description: Toggle name not recognised (not in FeatureToggleNames enum)
+        '404':
+          description: Toggle not found in database
+
+  /d-notice/{name}/{status}:
+    put:
+      tags:
+        - d-notice
+      summary: Set live status of a specific toggle
+      operationId: setSpecificToggle
+      description: |
+        Updates the `live` field on `CAPD_DNOTICE.feature_toggle` for the named toggle.
+        Uses `@UnitOfWork` (Dropwizard/Hibernate transaction boundary).
+
+        **Toggle name validation**: `name` MUST be a recognised `FeatureToggleNames` value.
+        Unrecognised names → HTTP 400.
+
+        **HTTP 400**: `name` is not a valid `FeatureToggleNames` value.
+        **HTTP 404**: Toggle not found in database (update affected 0 rows).
+        **HTTP 200**: Returns `CapdResponse<String>` with `_data="Great Success"`.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: name
+          in: path
+          required: true
+          description: Feature toggle name. Must be a recognised FeatureToggleNames value.
+          schema:
+            type: string
+          example: apply-for-bps
+        - name: status
+          in: path
+          required: true
+          description: New live status for the toggle (`true` = live, `false` = disabled)
+          schema:
+            type: boolean
+          example: true
+      responses:
+        '200':
+          description: Toggle updated. Body is `CapdResponse<String>` with `_data="Great Success"`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseString'
+              example:
+                _data: 'Great Success'
+        '400':
+          description: Toggle name not recognised (not in FeatureToggleNames enum)
+        '404':
+          description: Toggle not found in database
+
+  /d-notice/bulkUpdate:
+    put:
+      tags:
+        - d-notice
+      summary: Bulk update toggle live statuses
+      operationId: bulkUpdate
+      description: |
+        Updates the `live` field for multiple toggles in a single request.
+        Uses `@UnitOfWork` (single Hibernate transaction for all updates).
+
+        **Request**: Map of `{ toggleName: Boolean }` pairs in `togglesToUpdate`.
+
+        **Toggle name validation per entry**: Each key in `togglesToUpdate` is looked up
+        in `FeatureToggleNames`. Unknown names are added to `missingToggles` in the result
+        (not HTTP 400 — unlike single-toggle endpoints).
+
+        **Partial success handling**:
+        - Successfully updated toggles appear in `updatedToggles`.
+        - Toggles not found in the database appear in `missingToggles`.
+        - If `missingToggles` is non-empty (`!result.isSuccessful()`):
+          → HTTP 404, body is raw `BulkUpdateResult` JSON (NOT wrapped in `CapdResponse`)
+        - If all toggles updated (`missingToggles` empty):
+          → HTTP 200, body is `CapdResponse<BulkUpdateResult>`
+
+        **`isSuccessful()` is `@JsonIgnore`** — it does NOT appear in the JSON response.
+
+        **Note**: `togglesToUpdate` null values throw `IllegalArgumentException` (toggle
+        name and value must not be null) — propagates as HTTP 500.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkUpdateRequest'
+            example:
+              togglesToUpdate:
+                apply-for-bps: true
+                bank-details: false
+      responses:
+        '200':
+          description: All toggles updated. Wrapped in `CapdResponse._data`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseBulkUpdateResult'
+        '404':
+          description: |
+            One or more toggles not found in database. Body is raw `BulkUpdateResult`
+            JSON (NOT wrapped in `CapdResponse`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BulkUpdateResult'
+
+  /version:
+    get:
+      tags:
+        - version
+      summary: Application version check
+      operationId: getStatus
+      description: Returns the application version as plain text.
+      responses:
+        '200':
+          description: Application version
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  parameters:
+    callerId:
+      name: callerId
+      in: header
+      required: false
+      description: Internal CAPD caller identifier (BigInteger). Used for audit logging.
+      schema:
+        type: integer
+
+  schemas:
+    Toggle:
+      type: object
+      x-validation-source: Toggle.java (domain), db/Toggle.java (entity — CAPD_DNOTICE.feature_toggle)
+      description: |
+        Feature toggle. Stored in `CAPD_DNOTICE.feature_toggle`. The `name` field is the
+        primary key. All fields are NOT NULL in the database.
+
+        **Valid toggle names** (from `FeatureToggleNames` enum):
+        `additional-business-details`, `apply-for-bps`, `apply-for-funding`,
+        `apply-for-funding-2026`, `apply-for-lumpsum-exit`, `all-other-land-changes`,
+        `bank-details`, `bps-submission-notification`, `business-details`,
+        `case-management`, `cnc-notification`, `CO-offer`, `CO-agreement-live`,
+        `co-advisor-support`, `correspondence-address`, `cs-page`, `cs-agreement`,
+        `cs-app`, `cs-claims`, `cs-options-tool`, `cs-offer`, `cs-permissions`,
+        `customer-contact`, `digitisation-status`, `display-of-EOI-form`,
+        `display-of-message-totals`, `dp-approved-transaction`, `dp-transfer-ref-data`,
+        `duplicate-people`, `elm-permissions`, `elm-application`, `elm-payments`,
+        `sfi-application`, `mtol-application`, `beta-flag`,
+        `elm-sfi-agreement-offered`, `elm-sfi-agreement-live`,
+        `full-land-cover-change`, `sfi-agreement-live`, `sfi-agreement-offer`,
+        `SFIMT-offer`, `sfimt-agreement-live`, `skip-email-validation`,
+        `deactivate-organisation`, `deactivate-user`,
+        `enablePeopleLegallyResponsibleAndLandUkAndPercentageOwned`,
+        `enablePersonRegistration`, `first-line-address`, `hedges`, `land-viewer`,
+        `lms-sync-endpoint`, `merge-land-parcels`, `notification`, `online-banking`,
+        `annual-declaration`, `sfi-annual-declaration`, `organisation-amend`,
+        `organisation-amend-non-firm-of-agents`, `organisation-create`,
+        `organisation-delete-business`, `parcel-change-boundary`, `parcel-merge`,
+        `parcel-split`, `permission-notification`, `reference-numbers`,
+        `register-new-land`, `rotational-actions-declaration`,
+        `sfico-rotational-actions-declaration`,
+        `show-archive-customer-link-in-customer-record-page`,
+        `start-farming-question`, `security-question`, `submit-job-to-lms`,
+        `transfer-entitlements`, `transfer-land`, `update-bps-application`,
+        `update-common-rights`, `update-land-cover`, `update-land-use`,
+        `view-arable-offer-help`, `view-bps-claims`, `view-bps-direct-payments-help`,
+        `view-capital-claim-help`, `view-entitlements`, `view-capital-grants-help`,
+        `view-lowland-help`, `view-mixed-farming-help`, `view-revenue-claim-help`,
+        `view-upland-offer-help`, `view-woodland-help`, `mtol-help`,
+        `view-cph-information`, `csht-claims`, `Apply-EO-CSHT`, `forgotten-crn`
+      required:
+        - name
+        - description
+        - live
+        - defaultValue
+      properties:
+        name:
+          type: string
+          description: |
+            Toggle primary key. Must be a value from `FeatureToggleNames` enum.
+            No length constraint on the @Id column.
+        description:
+          type: string
+          description: Human-readable description. Max 60 characters (CAPD_DNOTICE.feature_toggle.description).
+          maxLength: 60
+        live:
+          type: boolean
+          description: |
+            Current live status. `true` = feature is enabled in the portal.
+            NOT NULL in database.
+        defaultValue:
+          type: boolean
+          description: |
+            Default status used as fallback. NOT NULL in database.
+
+    BulkUpdateRequest:
+      type: object
+      x-validation-source: BulkUpdateRequest.java
+      description: |
+        Request body for bulk toggle update. `togglesToUpdate` must not be null;
+        null keys or values throw `IllegalArgumentException` (→ HTTP 500).
+      required:
+        - togglesToUpdate
+      properties:
+        togglesToUpdate:
+          type: object
+          description: |
+            Map of `{ toggleName → Boolean }`. Keys should be valid `FeatureToggleNames`
+            values. Invalid names are collected in `missingToggles` in the response
+            (NOT HTTP 400).
+          additionalProperties:
+            type: boolean
+
+    BulkUpdateResult:
+      type: object
+      x-validation-source: BulkUpdateResult.java
+      description: |
+        Result of a bulk toggle update. `isSuccessful()` is `@JsonIgnore` and does NOT
+        appear in this JSON. Returned directly (not in `CapdResponse`) when HTTP 404.
+      properties:
+        updatedToggles:
+          type: object
+          description: Map of `{ toggleName → newLiveValue }` for successfully updated toggles
+          additionalProperties:
+            type: boolean
+        missingToggles:
+          type: array
+          description: List of toggle names not found in the database
+          items:
+            type: string
+
+    CapdResponseToggle:
+      type: object
+      description: CapdResponse wrapper containing a single Toggle
+      properties:
+        _data:
+          $ref: '#/components/schemas/Toggle'
+
+    CapdResponseToggleMap:
+      type: object
+      description: CapdResponse wrapper containing a map of toggle name → Toggle
+      properties:
+        _data:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/Toggle'
+
+    CapdResponseBulkUpdateResult:
+      type: object
+      description: CapdResponse wrapper containing BulkUpdateResult
+      properties:
+        _data:
+          $ref: '#/components/schemas/BulkUpdateResult'
+
+    CapdResponseString:
+      type: object
+      description: CapdResponse wrapper containing a String value
+      properties:
+        _data:
+          type: string

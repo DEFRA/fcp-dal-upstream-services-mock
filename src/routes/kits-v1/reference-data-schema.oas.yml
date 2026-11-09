@@ -1,0 +1,117 @@
+openapi: 3.1.0
+info:
+  title: Reference Data API
+  description: API for looking up reference data descriptions and codes
+  version: '1.0.0'
+  license:
+    name: 'Open Government Licence v3.0'
+    url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3'
+tags:
+  - name: reference-data
+    description: 'Operations related to reference data management'
+security:
+  - mTLS: []
+servers:
+  - url: 'https://chs-upgrade-api.ruraldev.org.uk:8446/extapi'
+    description: The test server for KITS/V1 APIs
+paths:
+  /reference/titles:
+    get:
+      tags:
+        - reference-data
+      summary: The enum of titles for a person
+      description: >
+        Request to get the accepted titles for a person.
+        These are the allowed values when updating the title of a person.
+      operationId: getTitles
+      responses:
+        '200':
+          description: A list of titles
+          $ref: '#/components/responses/Titles'
+        '403':
+          description: Getting titles is forbidden, or a WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+
+  /reference/business-types:
+    get:
+      tags:
+        - reference-data
+      summary: The enum of business types & their codes
+      description: >
+        Request to get the accepted business types & codes for a business.
+        These are the allowed values when updating the business type of a business.
+      operationId: getBusinessTypes
+      responses:
+        '200':
+          description: A list of business types and their codes
+          $ref: '#/components/responses/ReferenceData'
+        '403':
+          description: Getting business types is forbidden, or a WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+
+  /reference/legalstatus:
+    get:
+      tags:
+        - reference-data
+      summary: The enum of legal statuses for a business
+      description: >
+        Request to get the accepted legal statuses & codes for a business.
+        These are the allowed values when updating the legal status of a business.
+      operationId: getLegalStatuses
+      responses:
+        '200':
+          description: A list of legal statuses and their codes
+          $ref: '#/components/responses/ReferenceData'
+        '403':
+          description: Getting legal statuses is forbidden, or a WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+
+components:
+  responses:
+    ReferenceData:
+      description: A list of reference data items, each with a code and description
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              _data:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    code:
+                      type: string
+                      description: The code representing the reference datum
+                    description:
+                      type: string
+                      description: The human-readable description of the reference datum
+    Titles:
+      description: A list of titles for a person
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              _data:
+                type: array
+                items:
+                  type: string
+                  description: The title for a person
+
+    Forbidden:
+      description: Forbidden
+      content:
+        text/html:
+          schema:
+            type: string
+            example: |
+              <html><body><h1>403 Forbidden</h1>
+              Request forbidden by administrative rules.
+              </body></html>
+
+  securitySchemes:
+    mTLS:
+      type: mutualTLS
+      description: >
+        Mutual TLS authentication. Client must present a certificate issued by the server.

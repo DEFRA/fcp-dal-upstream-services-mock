@@ -1,0 +1,1770 @@
+openapi: '3.0.1'
+info:
+  title: CAPD Notification Service
+  version: v1
+  x-source-repository: notification-service
+  description: |
+    Dropwizard / Hibernate / Jersey (JAX-RS) service managing portal notifications,
+    bespoke (bulk SBI-targeted) notifications, customer contact (query/response) flows,
+    and notification privilege management.
+
+    **Database schema**: `CAPD_NOTIFICATION` (Oracle)
+    - `NOTIFICATION` — individual portal notifications (soft-deleted via `deleted_at`)
+    - `BESPOKE_NOTIFICATION` — admin-created bulk notifications with SBI target list
+    - `PRIVILEGE` — privilege records for bespoke notifications
+    - `CUSTOMER_QUERY` — customer contact queries
+    - `CUSTOMER_COMMUNICATIONS` — responses/communications on queries
+    - `CUSTOMER_CONTACT_PERMISSIONS`, `COUNTY`, `CUSTOMER_CONTACT_QUERY_TYPE`,
+      `CUSTOMER_CONTACT_SUBJECT`, `CC_MATRIX_REL`, `CUSTOMER_CONTACT_QUEUE`,
+      `CRM_QUEUE`, `CUSTOMER_CONTACT_GHOST_TEXT`, `MAPPING_CHANGES`
+
+    **Audit**: Most tables are audited with Hibernate Envers (`@Audited`).
+    Soft-delete on `NOTIFICATION` via `deleted_at` column with `@SQLRestriction("deleted_at is null")`.
+
+    **Authentication/Authorisation**:
+    - `callerId` and `userType` headers used for access control throughout.
+    - Internal users (`UserType.internal`) have full access.
+    - External users can only access their own resources (`callerId == personId`).
+    - `SERVICES_CALLER_ID` (configured system service caller) has special batch privileges.
+    - `@CapdInternalEndpoint(functions = "deactivatePerson")` on GDPR obfuscation endpoints.
+    - `@CapdPersonAuthorisation` on `GET /notifications/`.
+
+    **Undocumented endpoints** (not in original spec):
+    - `GET /mapping-changes/{personId}/{notificationId}/{sheetId}/{parcelId}` — internal use
+
+    **Status code corrections vs original spec**:
+    - `PUT /notifications/{id}` returns **204** not 200 on success
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: notifications
+    description: Core notification CRUD and lifecycle management
+  - name: bespoke-notifications
+    description: Bulk admin-created notifications targeting SBI lists
+  - name: privileges
+    description: Privilege management for bespoke notifications
+  - name: customer-contact
+    description: Customer contact query and communication flows
+  - name: mapping-changes
+    description: Land parcel mapping change notifications (internal)
+  - name: status
+    description: Application health check
+
+paths:
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application health check
+      operationId: getStatus
+      description: Returns plain text service status.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  # ─────────────────────────────────────────────────────────
+  # NotificationResource — @Path("/notifications")
+  # ─────────────────────────────────────────────────────────
+
+  /notifications:
+    post:
+      tags:
+        - notifications
+      summary: Create batch notifications
+      operationId: createNotifications
+      description: |
+        Creates multiple `NOTIFICATION` records in a single request. Restricted to
+        `SERVICES_CALLER_ID` (system service). Returns the IDs of the created records.
+
+        **HTTP 403**: `callerId` header does not match `SERVICES_CALLER_ID` (configured value).
+
+        Each `Notification` in the list is persisted to `CAPD_NOTIFICATION.NOTIFICATION`
+        with `createdAt=now`.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationRequest'
+      responses:
+        '200':
+          description: Notifications created. Returns list of new IDs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationIdsResponse'
+        '403':
+          description: callerId is not SERVICES_CALLER_ID
+
+    get:
+      tags:
+        - notifications
+      summary: Get paginated notifications for a person
+      operationId: getNotifications
+      description: |
+        Returns paginated notifications for the specified `personId` with optional filters.
+
+        **Authorisation**: `@CapdPersonAuthorisation` — caller must have access to the person.
+        Additionally, access check: internal user OR `callerId == personId`. HTTP 403 if denied.
+
+        **HTTP 400**: `personId` query param missing.
+        **HTTP 403**: Caller does not have permission to view this person's notifications.
+
+        **Filter values** (`filter` param):
+        - `archived` — only archived notifications (archivedAt IS NOT NULL)
+        - `notArchived` — only non-archived notifications (default)
+        - `notArchivedRead` — non-archived, already read
+        - `notArchivedNotRead` — non-archived, unread
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+        - name: personId
+          in: query
+          required: true
+          description: Person ID to retrieve notifications for. Required — HTTP 400 if missing.
+          schema:
+            type: integer
+        - name: organisationId
+          in: query
+          required: false
+          description: Optional filter by organisation ID
+          schema:
+            type: integer
+        - name: filter
+          in: query
+          required: false
+          description: |
+            Filter type: `archived` | `notArchived` | `notArchivedRead` | `notArchivedNotRead`
+          schema:
+            type: string
+            enum:
+              - archived
+              - notArchived
+              - notArchivedRead
+              - notArchivedNotRead
+        - name: orderBy
+          in: query
+          required: false
+          description: Sort order field
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paginated notifications with read/unread counts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationListResponse'
+        '400':
+          description: personId query param is missing
+        '403':
+          description: Caller does not have permission to access this person's notifications
+
+    delete:
+      tags:
+        - notifications
+      summary: Delete multiple notifications by ID
+      operationId: deleteNotifications
+      description: |
+        Soft-deletes multiple notifications by setting `deleted_at`. Restricted to
+        `SERVICES_CALLER_ID`.
+
+        **HTTP 403**: `callerId` does not match `SERVICES_CALLER_ID`.
+        **Returns HTTP 204** (No Content) on success.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: id
+          in: query
+          required: false
+          description: One or more notification IDs to delete. Repeat param for multiple.
+          schema:
+            type: array
+            items:
+              type: integer
+          style: form
+          explode: true
+      responses:
+        '204':
+          description: Notifications deleted (No Content)
+        '403':
+          description: callerId is not SERVICES_CALLER_ID
+
+  /notifications/count:
+    post:
+      tags:
+        - notifications
+      summary: Get notification counts by organisation
+      operationId: getNotificationCounts
+      description: |
+        Returns notification counts per organisation for the specified `personId`.
+
+        **HTTP 400**: `personId` query param is missing.
+        **HTTP 403**: Caller does not have access to this person's data.
+
+        Body is a list of organisation IDs to count notifications for.
+        Returns `HashMap<BigDecimal, NotificationCounts>` — keyed by organisationId.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: personId
+          in: query
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        description: List of organisation IDs to query
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: integer
+      responses:
+        '200':
+          description: Notification counts per organisation
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/NotificationCounts'
+        '400':
+          description: personId query param missing
+        '403':
+          description: Access denied
+
+  /notifications/weeklydigest:
+    get:
+      tags:
+        - notifications
+      summary: Trigger weekly digest email sending
+      operationId: weeklyDigest
+      description: |
+        Triggers sending of weekly digest notification emails. Restricted to `SERVICES_CALLER_ID`.
+        Checks the `NOTIFICATION` feature toggle is enabled before processing.
+
+        **HTTP 403**: `callerId` does not match `SERVICES_CALLER_ID`.
+        **HTTP 403**: NOTIFICATION feature toggle is disabled.
+
+        Returns empty response body on success.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Weekly digest emails sent
+        '403':
+          description: callerId not SERVICES_CALLER_ID or NOTIFICATION feature toggle disabled
+
+  /notifications/{id}:
+    get:
+      tags:
+        - notifications
+      summary: Get a notification by ID
+      operationId: getNotificationById
+      description: |
+        Returns a single `NOTIFICATION` by primary key. Checks caller has permission to
+        access the notification's `personId`.
+
+        **HTTP 403**: Caller does not have permission to view this notification.
+        **HTTP 404**: Notification not found.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: id
+          in: path
+          required: true
+          description: Notification primary key (BigInteger)
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Notification found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+        '403':
+          description: Access denied for this notification's personId
+        '404':
+          description: Notification not found
+
+    put:
+      tags:
+        - notifications
+      summary: Update a notification
+      operationId: updateNotification
+      description: |
+        Updates a `NOTIFICATION` record (e.g., set `readAt`, `archivedAt`). Verifies
+        caller has access to the notification's `personId`.
+
+        **HTTP 403**: Caller does not have permission to modify this notification.
+        **HTTP 404**: Notification not found.
+        **Returns HTTP 204** (No Content) on success.
+        **NOTE**: Original spec states HTTP 200 — **actual source returns HTTP 204**.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: id
+          in: path
+          required: true
+          description: Notification primary key (BigInteger)
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Notification'
+      responses:
+        '204':
+          description: 'Notification updated (No Content). NOTE: original spec says 200.'
+        '403':
+          description: Access denied
+        '404':
+          description: Notification not found
+
+  /notifications/{personId}/all:
+    delete:
+      tags:
+        - notifications
+      summary: Delete all archived notifications for a person
+      operationId: deleteAllArchivedForPerson
+      description: |
+        Hard-deletes all archived (`archivedAt IS NOT NULL`) notifications for `personId`.
+        Checks caller has access to `personId`.
+
+        **HTTP 204**: Success (No Content).
+        **HTTP 403**: Access denied.
+        **HTTP 404**: No archived notifications found (nothing deleted).
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: personId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '204':
+          description: All archived notifications deleted
+        '403':
+          description: Access denied for this personId
+        '404':
+          description: No archived notifications found for this person
+
+  /notifications/{personId}/restore-all:
+    put:
+      tags:
+        - notifications
+      summary: Restore all archived notifications for a person
+      operationId: restoreAllArchivedForPerson
+      description: |
+        Clears `archivedAt` on all archived notifications for `personId`. Checks access.
+
+        **HTTP 204**: Success.
+        **HTTP 403**: Access denied.
+        **HTTP 404**: No archived notifications found.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: personId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '204':
+          description: All archived notifications restored
+        '403':
+          description: Access denied
+        '404':
+          description: No archived notifications found
+
+  /notifications/{personId}/organisation/{organisationId}:
+    delete:
+      tags:
+        - notifications
+      summary: Delete all archived notifications for a person+organisation pair
+      operationId: deleteAllArchivedForPersonAndOrg
+      description: |
+        Hard-deletes all archived notifications for `personId` AND `organisationId`.
+
+        **HTTP 204**: Success.
+        **HTTP 403**: Access denied.
+        **HTTP 404**: Nothing to delete.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: personId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: organisationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '204':
+          description: Deleted (No Content)
+        '403':
+          description: Access denied
+        '404':
+          description: Nothing found to delete
+
+  /notifications/{personId}/restore/{organisationId}:
+    put:
+      tags:
+        - notifications
+      summary: Restore all archived notifications for a person+organisation pair
+      operationId: restoreAllArchivedForPersonAndOrg
+      description: |
+        Clears `archivedAt` on all archived notifications for `personId` AND `organisationId`.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: personId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: organisationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '204':
+          description: Restored (No Content)
+        '403':
+          description: Access denied
+        '404':
+          description: No archived notifications found
+
+  /notifications/{personId}/restore-one/{notificationId}:
+    patch:
+      tags:
+        - notifications
+      summary: Restore a single archived notification
+      operationId: restoreOneNotification
+      description: |
+        Restores a single archived notification by clearing `archivedAt`. Validates that
+        `personId` and `notificationId` match the values in the request body.
+
+        **HTTP 403**: Access denied.
+        **HTTP 404**: Notification not found.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: personId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: notificationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationRequest'
+      responses:
+        '200':
+          description: Notification restored
+        '403':
+          description: Access denied
+        '404':
+          description: Notification not found
+
+  /notifications/{personId}/one/{notificationId}:
+    delete:
+      tags:
+        - notifications
+      summary: Delete a specific notification (requires prior archiving)
+      operationId: deleteOneNotification
+      description: |
+        Hard-deletes a specific notification for `personId`. The notification must be
+        archived first (`archivedAt IS NOT NULL`).
+
+        **HTTP 204**: Success.
+        **HTTP 403**: Access denied.
+        **HTTP 404**: Notification not found.
+        **HTTP 422**: Notification is not yet archived (cannot delete unarchived notification).
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: personId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: notificationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '204':
+          description: Notification deleted (No Content)
+        '403':
+          description: Access denied
+        '404':
+          description: Notification not found
+        '422':
+          description: Notification must be archived before it can be deleted
+
+  /notifications/obfuscate/{personId}/{obfuscationId}:
+    delete:
+      tags:
+        - notifications
+      summary: GDPR obfuscation of notifications for a person
+      operationId: obfuscateNotifications
+      description: |
+        Replaces `body` and `title` fields in `NOTIFICATION` records for `personId` with
+        `obfuscationId`. Used in the person deactivation / GDPR erasure flow.
+
+        **Authorisation**: `@CapdInternalEndpoint(functions = "deactivatePerson")` — requires
+        internal endpoint access. HTTP 403 if missing.
+
+        **HTTP 200**: Returns the count of obfuscated records as a String.
+        **HTTP 500**: Internal error during obfuscation.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: personId
+          in: path
+          required: true
+          description: Person ID whose notifications will be obfuscated
+          schema:
+            type: integer
+        - name: obfuscationId
+          in: path
+          required: true
+          description: Replacement string for PII fields (body, title)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Obfuscation complete. Body is count of records obfuscated as a String.
+          content:
+            application/json:
+              schema:
+                type: string
+        '403':
+          description: Missing deactivatePerson internal endpoint privilege
+        '500':
+          description: Internal error during obfuscation
+
+  # ─────────────────────────────────────────────────────────
+  # BespokeNotificationResource — @Path("notifications/bespoke-notifications")
+  # ─────────────────────────────────────────────────────────
+
+  /notifications/bespoke-notifications/all:
+    get:
+      tags:
+        - bespoke-notifications
+      summary: Get all bespoke notifications (grouped by status)
+      operationId: getAllBespokeNotifications
+      description: |
+        Returns all bespoke notifications from `BESPOKE_NOTIFICATION`, optionally filtered
+        by `group` (default: "send"). Returns `BespokeNotificationListResponse` with list.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: group
+          in: query
+          required: false
+          description: Group filter. Default "send".
+          schema:
+            type: string
+            default: send
+      responses:
+        '200':
+          description: List of bespoke notifications
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BespokeNotificationListResponse'
+
+  /notifications/bespoke-notifications/search:
+    get:
+      tags:
+        - bespoke-notifications
+      summary: Search bespoke notifications by keyword
+      operationId: searchBespokeNotifications
+      description: |
+        Searches `BESPOKE_NOTIFICATION.subject` and `message` for the given keyword.
+        Supports pagination.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: keyWord
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: group
+          in: query
+          required: false
+          schema:
+            type: string
+            default: send
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BespokeNotificationListResponse'
+
+  /notifications/bespoke-notifications/create:
+    post:
+      tags:
+        - bespoke-notifications
+      summary: Create a bespoke notification
+      operationId: createBespokeNotification
+      description: |
+        Creates a new `BESPOKE_NOTIFICATION` record with associated `PRIVILEGE` records.
+        Sets `createdBy=callerId`, `createdDate=now`, `isProcessed=false`.
+
+        **HTTP 400**: Request body is null.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BespokeNotificationRequest'
+      responses:
+        '200':
+          description: Bespoke notification created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BespokeNotification'
+        '400':
+          description: Request body is null
+
+  /notifications/bespoke-notifications/validate-file:
+    post:
+      tags:
+        - bespoke-notifications
+      summary: Validate an SBI list CSV file
+      operationId: validateBespokeNotificationFile
+      description: |
+        Validates a multipart CSV file containing SBI (Single Business Identifier) numbers.
+
+        **Validation rules**:
+        - HTTP 400: Input stream is null
+        - HTTP 404: File is empty (no content)
+        - HTTP 413: File contains too many lines (exceeds configured maximum)
+        - HTTP 422: File format invalid — each line must be a 9-digit numeric SBI
+          (`[0-9]{9}`)
+
+        **On success**: Returns HTTP 200 with the validated SBI count or list.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: CSV file. One SBI (`[0-9]{9}`) per line.
+      responses:
+        '200':
+          description: File is valid
+        '400':
+          description: Input stream is null
+        '404':
+          description: File is empty
+        '413':
+          description: File contains too many SBI entries (exceeds configured maximum)
+        '422':
+          description: File format invalid — each line must be a 9-digit numeric SBI
+
+  /notifications/bespoke-notifications/add-file/{id}:
+    post:
+      tags:
+        - bespoke-notifications
+      summary: Upload SBI list to a bespoke notification
+      operationId: addFileToBespokeNotification
+      description: |
+        Uploads a validated SBI list CSV and attaches it to `BESPOKE_NOTIFICATION.sbi`
+        (stored as CLOB) for the given notification ID.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: id
+          in: path
+          required: true
+          description: Bespoke notification primary key (BigInteger)
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: CSV file with SBI numbers (one per line)
+      responses:
+        '200':
+          description: SBI list uploaded and stored
+
+  /notifications/bespoke-notifications/process:
+    get:
+      tags:
+        - bespoke-notifications
+      summary: Get bespoke notifications ready for processing
+      operationId: getBespokeNotificationsToProcess
+      description: |
+        Returns all `BESPOKE_NOTIFICATION` records where `isProcessed=false` and
+        `sendDate <= timestamp`. Used by batch processing jobs.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: timestamp
+          in: query
+          required: false
+          description: |
+            Reference timestamp in format `yyyyMMddHHmmss`. Returns notifications
+            with `sendDate` at or before this timestamp.
+          schema:
+            type: string
+            pattern: '^\d{14}$'
+          example: '20240115120000'
+      responses:
+        '200':
+          description: List of bespoke notifications ready to process
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BespokeNotificationListResponse'
+
+  /notifications/bespoke-notifications/mark-processed:
+    put:
+      tags:
+        - bespoke-notifications
+      summary: Mark bespoke notifications as processed
+      operationId: markBespokeNotificationsProcessed
+      description: |
+        Sets `isProcessed=true` on the specified `BESPOKE_NOTIFICATION` IDs.
+        Used by batch processing jobs after successful notification dispatch.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      requestBody:
+        required: true
+        description: List of bespoke notification IDs to mark as processed
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: integer
+      responses:
+        '200':
+          description: Notifications marked as processed
+
+  /notifications/bespoke-notifications/{id}:
+    get:
+      tags:
+        - bespoke-notifications
+      summary: Get a bespoke notification by ID
+      operationId: getBespokeNotificationById
+      description: |
+        Returns a single `BESPOKE_NOTIFICATION` by primary key.
+
+        **HTTP 404**: Not found.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: id
+          in: path
+          required: true
+          description: Bespoke notification primary key (BigInteger)
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Bespoke notification found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BespokeNotification'
+        '404':
+          description: Bespoke notification not found
+
+    put:
+      tags:
+        - bespoke-notifications
+      summary: Update a bespoke notification
+      operationId: updateBespokeNotification
+      description: |
+        Updates an existing `BESPOKE_NOTIFICATION` record and its associated privileges.
+
+        **HTTP 400**: Request body is null.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: id
+          in: path
+          required: true
+          description: Bespoke notification primary key (BigInteger)
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BespokeNotificationRequest'
+      responses:
+        '200':
+          description: Bespoke notification updated
+        '400':
+          description: Request body is null
+
+    delete:
+      tags:
+        - bespoke-notifications
+      summary: Delete a bespoke notification
+      operationId: deleteBespokeNotification
+      description: |
+        Deletes a `BESPOKE_NOTIFICATION` record and associated `PRIVILEGE` records.
+
+        **HTTP 404**: Bespoke notification not found.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: id
+          in: path
+          required: true
+          description: Bespoke notification primary key (BigInteger)
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Bespoke notification deleted
+        '404':
+          description: Bespoke notification not found
+
+  /notifications/bespoke-notifications/sbi-list-to-process/{id}:
+    get:
+      tags:
+        - bespoke-notifications
+      summary: Get SBI list for a bespoke notification
+      operationId: getSbiListForBespokeNotification
+      description: |
+        Returns the list of SBIs (as an array of BigIntegers) stored in
+        `BESPOKE_NOTIFICATION.sbi` (CLOB) for the given notification ID.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: id
+          in: path
+          required: true
+          description: Bespoke notification primary key (BigInteger)
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: SBI list as array of BigInteger
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: integer
+
+  # ─────────────────────────────────────────────────────────
+  # PrivilegeResource — @Path("/notifications/priviledges")
+  # NOTE: "priviledges" is the actual URL path (typo in source)
+  # ─────────────────────────────────────────────────────────
+
+  /notifications/priviledges:
+    get:
+      tags:
+        - privileges
+      summary: Get all privileges
+      operationId: getAllPrivileges
+      description: |
+        Returns all `PRIVILEGE` records from `CAPD_NOTIFICATION.PRIVILEGE`.
+
+        **Note**: The URL path uses the misspelled `priviledges` (source code typo).
+      responses:
+        '200':
+          description: All privileges
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegeListResponse'
+
+  /notifications/priviledges/{bn-id}:
+    get:
+      tags:
+        - privileges
+      summary: Get privileges for a bespoke notification
+      operationId: getPrivilegesForBespokeNotification
+      description: |
+        Returns all `PRIVILEGE` records associated with the given `BESPOKE_NOTIFICATION` ID.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: bn-id
+          in: path
+          required: true
+          description: Bespoke notification ID (BigInteger)
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Privileges for this bespoke notification
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivilegeListResponse'
+
+    post:
+      tags:
+        - privileges
+      summary: Create privileges for a bespoke notification
+      operationId: createPrivilegesForBespokeNotification
+      description: |
+        Creates `PRIVILEGE` records for the given `BESPOKE_NOTIFICATION` ID.
+
+        **HTTP 400**: Request body is null.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: bn-id
+          in: path
+          required: true
+          description: Bespoke notification ID (BigInteger)
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivilegeRequest'
+      responses:
+        '200':
+          description: Privileges created. Returns bespoke notification ID.
+        '400':
+          description: Request body is null
+
+  # ─────────────────────────────────────────────────────────
+  # CustomerContactResource — @Path("customer-contact")
+  # ─────────────────────────────────────────────────────────
+
+  /customer-contact:
+    put:
+      tags:
+        - customer-contact
+      summary: Get customer contact form fields
+      operationId: getCustomerContactFormFields
+      description: |
+        Returns available form fields (query types, subjects, counties, CRM queues)
+        based on the caller's permissions for the given business.
+
+        **HTTP 400**: `CCSelectedBusiness` in request is empty.
+        **HTTP 404**: No permissions found for this business.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerContactFormFieldsRequest'
+      responses:
+        '200':
+          description: Form fields available for this business
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerContactFormFieldsResponse'
+        '400':
+          description: Business info is empty in request
+        '404':
+          description: No permissions found for this business
+
+  /customer-contact/query:
+    post:
+      tags:
+        - customer-contact
+      summary: Create a customer contact query
+      operationId: createCustomerContactQuery
+      description: |
+        Saves a new customer query to `CAPD_NOTIFICATION.CUSTOMER_QUERY` and posts it
+        to the queue for CRM processing.
+
+        **Returns**: BigInteger `queryId` of the created record.
+
+        **Field constraints** (from `CUSTOMER_QUERY` entity):
+        - `customerReference`: max 16, pattern `^[0-9]+$`, NOT NULL
+        - `customerName`: max 300, NOT NULL
+        - `businessName`: max 160, NOT NULL
+        - `cc_subject`: max 100, NOT NULL
+        - `permissions`: max 1000, NOT NULL
+        - `esAgreementReference`: pattern `^AG[0-9]{8}$` (if provided)
+        - `esClaimReferenceNumber`: pattern `^CL[0-9]{8,10}$` (if provided)
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerContactQueryRequest'
+      responses:
+        '200':
+          description: Query created. Returns queryId (BigInteger).
+          content:
+            application/json:
+              schema:
+                type: integer
+
+  /customer-contact/communication:
+    post:
+      tags:
+        - customer-contact
+      summary: Add a communication to a customer query
+      operationId: createCustomerContactCommunication
+      description: |
+        Creates a `CUSTOMER_COMMUNICATIONS` record for the given query. If
+        `queryCommunicationType=QUERY`, also posts to the CRM queue.
+
+        **Returns**: BigInteger `communicationId` of the created record.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerContactCommunicationRequest'
+      responses:
+        '200':
+          description: Communication created. Returns communicationId (BigInteger).
+          content:
+            application/json:
+              schema:
+                type: integer
+
+  /customer-contact/crm-response:
+    post:
+      tags:
+        - customer-contact
+      summary: Process CRM response communications (XML)
+      operationId: processCrmResponse
+      description: |
+        Accepts an XML `ExternalEnvelope` payload from the CRM system containing
+        response communications. Processes each communication in the envelope.
+
+        **HTTP 429**: Number of CRM responses in the payload exceeds `maxCrmRequests`
+        (configured maximum).
+        **HTTP 400**: Any individual communication fails to process.
+
+        **Content-Type**: `application/xml`
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema:
+              type: object
+              description: ExternalEnvelope XML document from CRM. Schema is x-schema-incomplete.
+              x-schema-incomplete: true
+      responses:
+        '200':
+          description: All CRM responses processed successfully
+        '400':
+          description: One or more CRM responses failed to process
+        '429':
+          description: Payload exceeds maxCrmRequests limit
+
+  /customer-contact/query/{queryId}/{crn}/hidden:
+    put:
+      tags:
+        - customer-contact
+      summary: Mark a customer query as hidden
+      operationId: markQueryHidden
+      description: Sets `hidden_flag=true` on the `CUSTOMER_QUERY` record.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: queryId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: crn
+          in: path
+          required: true
+          description: Customer Reference Number
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Query marked as hidden
+
+  /customer-contact/query/{queryId}/mark-complaint:
+    put:
+      tags:
+        - customer-contact
+      summary: Mark a query as Complaints and Appeals
+      operationId: markQueryAsComplaint
+      description: |
+        Changes the query type to Complaints & Appeals and posts an update to the CRM queue.
+        Returns the queryId.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: queryId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerContactQueryRequest'
+      responses:
+        '200':
+          description: Query marked as complaint. Returns queryId.
+          content:
+            application/json:
+              schema:
+                type: integer
+
+  /customer-contact/query/{queryId}/{crn}/closed:
+    put:
+      tags:
+        - customer-contact
+      summary: Mark a customer query as closed
+      operationId: markQueryClosed
+      description: Sets the query status to closed and posts to the CRM queue.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: queryId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: crn
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Query closed
+
+  /customer-contact/query/{queryId}/{crn}/printed:
+    put:
+      tags:
+        - customer-contact
+      summary: Mark a customer query as printed
+      operationId: markQueryPrinted
+      description: Sets the query's printed status flag.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: queryId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: crn
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Query marked as printed
+
+  /customer-contact/communication/{queryId}/{crn}/{communicationId}/read:
+    put:
+      tags:
+        - customer-contact
+      summary: Mark a communication as read
+      operationId: markCommunicationRead
+      description: Sets a read timestamp on `CUSTOMER_COMMUNICATIONS` for the given IDs.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: queryId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: crn
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: communicationId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Communication marked as read
+
+  /customer-contact/all-queries/{crn}/{queriesFolder}:
+    get:
+      tags:
+        - customer-contact
+      summary: Get all queries for a CRN in a folder
+      operationId: getAllQueriesForCrn
+      description: |
+        Returns all `CUSTOMER_QUERY` records for the given CRN in the specified folder
+        (`SENT` or `INBOX`).
+
+        **HTTP 400**: CRN is null or empty.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: crn
+          in: path
+          required: true
+          description: Customer Reference Number. HTTP 400 if null/empty.
+          schema:
+            type: string
+        - name: queriesFolder
+          in: path
+          required: true
+          description: 'Folder type. Enum: `SENT` | `INBOX`'
+          schema:
+            type: string
+            enum:
+              - SENT
+              - INBOX
+      responses:
+        '200':
+          description: Customer query list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerContactQueryResponse'
+        '400':
+          description: CRN is null or empty
+
+  /customer-contact/view-query-details/{crn}/{queryId}:
+    get:
+      tags:
+        - customer-contact
+      summary: Get details for a specific query
+      operationId: getQueryDetails
+      description: |
+        Returns the query details and all associated communications for `queryId`
+        belonging to `crn`.
+
+        **HTTP 400**: CRN is null or empty.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: crn
+          in: path
+          required: true
+          description: Customer Reference Number
+          schema:
+            type: string
+        - name: queryId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Query details with communications
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerContactQueryDetailsResponse'
+        '400':
+          description: CRN is null or empty
+
+  # ─────────────────────────────────────────────────────────
+  # MappingChangesResource — @Path("/mapping-changes")
+  # ─────────────────────────────────────────────────────────
+
+  /mapping-changes/{personId}/{notificationId}/{sheetId}/{parcelId}:
+    get:
+      tags:
+        - mapping-changes
+      summary: Get mapping changes for a land parcel (undocumented)
+      operationId: getMappingChanges
+      description: |
+        Returns mapping change records from `CAPD_NOTIFICATION.MAPPING_CHANGES` for the
+        given person, notification, sheet, and parcel combination.
+
+        **Note**: This endpoint is NOT in the original OpenAPI spec. Internal use only.
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          schema:
+            type: integer
+        - name: personId
+          in: path
+          required: true
+          description: CAPD person ID (BigInteger)
+          schema:
+            type: integer
+        - name: notificationId
+          in: path
+          required: true
+          description: Notification primary key (BigInteger)
+          schema:
+            type: integer
+        - name: sheetId
+          in: path
+          required: true
+          description: Land sheet reference ID
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Land parcel ID
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Mapping change records for the parcel
+          content:
+            application/json:
+              schema:
+                x-schema-incomplete: true
+                type: object
+
+components:
+  parameters:
+    callerId:
+      name: callerId
+      in: header
+      required: false
+      description: Internal CAPD caller identifier (BigInteger)
+      schema:
+        type: integer
+    userType:
+      name: userType
+      in: header
+      required: false
+      description: |
+        Caller user type. `internal` = internal CAPD staff. `external` = citizen/farmer.
+        Used for access control in many endpoints.
+      schema:
+        type: string
+
+  schemas:
+    Notification:
+      type: object
+      x-validation-source: Notification.java (notification-service-api)
+      description: |
+        Portal notification entity. Stored in `CAPD_NOTIFICATION.NOTIFICATION`.
+        Soft-deleted via `deleted_at` column (`@SQLRestriction("deleted_at is null")`).
+        `read` and `archive` are transient write-only setters — they set `readAt` and
+        `archivedAt` respectively. `@Audited` (Hibernate Envers).
+      properties:
+        id:
+          type: integer
+          description: Primary key (sequence capd_notification_sequence)
+        personId:
+          type: integer
+          description: Person ID. NOT NULL.
+        organisationId:
+          type: integer
+          description: Organisation ID. Nullable.
+        messageId:
+          type: integer
+          description: Message ID. NOT NULL.
+        readAt:
+          type: string
+          format: date-time
+          description: Timestamp when notification was read. Null if unread.
+        read:
+          type: boolean
+          description: Write-only setter. Setting true sets `readAt=now`.
+        archivedAt:
+          type: string
+          format: date-time
+          description: Timestamp when notification was archived. Null if not archived.
+        archive:
+          type: boolean
+          description: Write-only setter. Setting true sets `archivedAt=now`; false clears it.
+        createdAt:
+          type: string
+          format: date-time
+          description: Creation timestamp. NOT NULL. Set by service on create.
+        title:
+          type: string
+          description: Notification title. NOT NULL. VARCHAR column.
+        body:
+          type: string
+          description: Notification body. NOT NULL. CLOB column.
+        category:
+          type: string
+          enum:
+            - AccountLevel
+            - OrganisationLevel
+          description: NOT NULL. VARCHAR column.
+        bespokeNotificationId:
+          type: integer
+          description: FK to BESPOKE_NOTIFICATION. Nullable.
+
+    NotificationRequest:
+      type: object
+      x-validation-source: NotificationRequest.java (notification-service-api)
+      properties:
+        notifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notification'
+
+    NotificationIdsResponse:
+      type: object
+      x-validation-source: NotificationIdsResponse.java (notification-service-api)
+      properties:
+        ids:
+          type: array
+          items:
+            type: integer
+
+    NotificationListResponse:
+      type: object
+      x-validation-source: NotificationListResponse.java (notification-service-api)
+      properties:
+        notifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notification'
+        resultCount:
+          type: integer
+          format: int64
+          description: Total matching notifications (for pagination)
+        unreadCount:
+          type: integer
+          format: int64
+          description: Total unread notifications for the person/filter
+        readCount:
+          type: integer
+          format: int64
+          description: Total read notifications for the person/filter
+
+    NotificationCounts:
+      type: object
+      x-schema-incomplete: true
+      description: Notification counts per organisation
+      properties:
+        total:
+          type: integer
+        unread:
+          type: integer
+
+    BespokeNotification:
+      type: object
+      x-validation-source: BespokeNotification.java (notification-service-api)
+      description: |
+        Bespoke (bulk) notification. Stored in `CAPD_NOTIFICATION.BESPOKE_NOTIFICATION`.
+        The domain entity additionally has `isProcessed` (Boolean) and `sbi` (CLOB) fields
+        which are NOT in the API DTO.
+      properties:
+        id:
+          type: integer
+          description: Primary key (sequence bespoke_notification_sequence)
+        subject:
+          type: string
+          description: Email subject. NOT NULL.
+        message:
+          type: string
+          description: Notification message body. NOT NULL. CLOB.
+        createdDate:
+          type: string
+          format: date-time
+          description: Creation timestamp. NOT NULL. Read-only.
+        createdBy:
+          type: integer
+          description: callerId of creator. NOT NULL. Read-only.
+        sendDate:
+          type: string
+          format: date-time
+          description: Scheduled send date. NOT NULL.
+
+    BespokeNotificationRequest:
+      type: object
+      x-validation-source: BespokeNotificationRequest.java (notification-service-api)
+      description: |
+        Request for creating/updating a bespoke notification. Note the misspelled
+        field name `bespokenotification` (actual `@JsonProperty` value in source — typo).
+      properties:
+        bespokenotification:
+          $ref: '#/components/schemas/BespokeNotification'
+          description: |
+            JSON property name is `bespokenotification` (no camelCase — source typo).
+        priviledges:
+          type: array
+          description: |
+            JSON property name is `priviledges` (misspelled in source — actual URL and field typo).
+          items:
+            $ref: '#/components/schemas/Privilege'
+
+    BespokeNotificationListResponse:
+      type: object
+      x-validation-source: BespokeNotificationListResponse.java (notification-service-api)
+      properties:
+        bespokeNotifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/BespokeNotification'
+
+    Privilege:
+      type: object
+      x-validation-source: Privilege.java (notification-service-api)
+      description: Privilege entity. Stored in `CAPD_NOTIFICATION.PRIVILEGE`.
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+          description: NOT NULL.
+        description:
+          type: string
+          description: Nullable.
+
+    PrivilegeRequest:
+      type: object
+      x-validation-source: PrivilegeRequest.java (notification-service-api)
+      properties:
+        privileges:
+          type: array
+          items:
+            $ref: '#/components/schemas/Privilege'
+
+    PrivilegeListResponse:
+      type: object
+      x-validation-source: PrivilegeListResponse.java (notification-service-api)
+      properties:
+        privileges:
+          type: array
+          items:
+            $ref: '#/components/schemas/Privilege'
+
+    CustomerContactQueryRequest:
+      type: object
+      x-validation-source: CustomerContactQueryRequest.java (notification-service-api)
+      description: |
+        Customer contact query creation request. Maps to `CAPD_NOTIFICATION.CUSTOMER_QUERY`.
+      properties:
+        customerReference:
+          type: string
+          description: CRN. Pattern `^[0-9]+$`. Max 16 characters. NOT NULL.
+          maxLength: 16
+          pattern: '^[0-9]+$'
+        customerName:
+          type: string
+          description: Customer name. Max 300 characters. NOT NULL.
+          maxLength: 300
+        businessId:
+          type: integer
+          description: Business ID (BigInteger). NOT NULL.
+        sbi:
+          type: integer
+          format: int64
+          description: 9-digit Single Business Identifier. NOT NULL.
+        businessName:
+          type: string
+          description: Business name. Max 160 characters. NOT NULL.
+          maxLength: 160
+        permissions:
+          type: array
+          description: List of CCPermissions for this business
+          items:
+            type: string
+        queryType:
+          type: string
+          description: Query type code. NOT NULL.
+        subject:
+          type: string
+          description: Query subject. Max 100 characters. NOT NULL.
+          maxLength: 100
+        countyName:
+          type: string
+          description: County name (nullable)
+        csAgreementReference:
+          type: integer
+          description: CS agreement reference (BigInteger, nullable)
+        csClaimReferenceNumber:
+          type: integer
+          description: CS claim reference number (BigInteger, nullable)
+        esAgreementReference:
+          type: string
+          description: ES agreement reference. Pattern `^AG[0-9]{8}$` (e.g., AG00123456). Nullable.
+          pattern: '^AG[0-9]{8}$'
+        esClaimReferenceNumber:
+          type: string
+          description: ES claim reference number. Pattern `^CL[0-9]{8,10}$`. Nullable.
+          pattern: '^CL[0-9]{8,10}$'
+        paymentYear:
+          type: integer
+          description: Payment year (BigInteger, nullable)
+        queryFreeTextArea:
+          type: string
+          description: Free text query body. NOT NULL. CLOB.
+        ccCrmQueueId:
+          type: integer
+          description: CRM queue ID (BigInteger). NOT NULL.
+        ccCrmQueue:
+          type: string
+          description: CRM queue name. Max 100 characters. NOT NULL.
+          maxLength: 100
+        permissionId:
+          type: integer
+          description: Permission ID (BigInteger). NOT NULL.
+
+    CustomerContactCommunicationRequest:
+      type: object
+      x-validation-source: CustomerContactCommunicationRequest.java (notification-service-api)
+      description: Request to add a communication to an existing customer query.
+      properties:
+        queryId:
+          type: integer
+          description: Parent query ID (BigInteger)
+        queryCommunicationType:
+          type: string
+          description: Communication direction. `QUERY` = outbound to CRM, `RESPONSE` = inbound from CRM.
+          enum:
+            - QUERY
+            - RESPONSE
+        queryCommunication:
+          type: string
+          description: Communication text body. CLOB.
+
+    CustomerContactFormFieldsRequest:
+      type: object
+      x-validation-source: CustomerContactFormFieldsRequest.java (notification-service-api)
+      description: Request to get available form fields for customer contact.
+      properties:
+        ccSelectedBusiness:
+          type: object
+          description: Selected business details
+          properties:
+            id:
+              type: integer
+            businessName:
+              type: string
+            sbi:
+              type: integer
+              format: int64
+
+    CustomerContactFormFieldsResponse:
+      x-schema-incomplete: true
+      type: object
+      description: Available form options for customer contact query.
+      properties:
+        queryTypes:
+          type: array
+          items:
+            type: object
+        subjects:
+          type: array
+          items:
+            type: object
+        counties:
+          type: array
+          items:
+            type: object
+        crmQueues:
+          type: array
+          items:
+            type: object
+
+    CustomerContactQueryResponse:
+      x-schema-incomplete: true
+      type: object
+      description: Lists of customer contact queries in SENT and INBOX folders.
+      properties:
+        sentQueries:
+          type: array
+          items:
+            type: object
+        inboxQueries:
+          type: array
+          items:
+            type: object
+
+    CustomerContactQueryDetailsResponse:
+      x-schema-incomplete: true
+      type: object
+      description: Full detail of a single customer query with communications.
+      properties:
+        query:
+          type: object
+        communications:
+          type: array
+          items:
+            type: object

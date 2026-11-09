@@ -1,0 +1,334 @@
+openapi: '3.0.1'
+info:
+  title: Bank Details Validator Service
+  version: v1
+  x-source-repository: bank-details-validator-service
+  description: |
+    Proxies bank account validation requests to the LexisNexis SafePayment system and returns
+    the result. This service is a downstream dependency of bank-change-service and should not
+    be called directly by portal frontends.
+
+    **Upstream consumers**: bank-change-service (sole direct consumer).
+
+    **Downstream dependencies**:
+    - LexisNexis SafePayment API — authentication (bearer token) + account validation endpoint
+    - LexisNexis country-currency lookup endpoint
+
+    **Authentication**: No authentication scheme is declared at this service level. Internal
+    service-to-service communication only; authentication with LexisNexis is handled
+    internally using a configured bearer token.
+
+    **Validation layers**: No JSR-303 bean validation annotations are present on any DTOs.
+    No field-level validation is enforced by this service — all validation is delegated to
+    LexisNexis. If LexisNexis returns a non-2xx response, the service returns HTTP 500.
+
+    **LexisNexis request mapping** (from `LexisNexisAccountValidationService`):
+    - `nationalId` → `account.bank.sortCode`
+    - `accountNumber` → `account.iban` if non-blank, otherwise `account.number`
+    - `countryCode` → `country.code`
+
+servers:
+  - url: http://localhost:9041
+    description: Local development server (default port 9041)
+
+tags:
+  - name: validation
+    description: Bank account detail validation against LexisNexis
+  - name: reference
+    description: Reference data — country and currency codes from LexisNexis
+
+paths:
+  /bank-details-validator-service/v1/validate/details:
+    post:
+      tags:
+        - validation
+      summary: Validate bank account details against LexisNexis SafePayment
+      operationId: validateBankDetails
+      description: |
+        Validates the provided bank account details against the LexisNexis SafePayment system.
+        No field-level validation is applied by this service — all validation is delegated to
+        LexisNexis.
+
+        **LexisNexis request construction** (from `LexisNexisAccountValidationService`):
+        The service transforms the incoming `ValidationRequest` into a LexisNexis
+        `LexisNexisVerificationRequest` as follows:
+        - `nationalId` ← `account.bank.sortCode`
+        - `accountNumber` ← `account.iban` if non-blank, otherwise `account.number`
+        - `countryCode` ← `country.code`
+
+        Fields not present in `AccountDetails` (name, buildingSocietyRollNumber, accountType)
+        are not forwarded to LexisNexis in the verification request.
+
+        **Response status values**:
+        - `MATCH`: LexisNexis confirmed a full match
+        - `PARTIAL_MATCH`: LexisNexis confirmed a partial match
+        - `FAILED`: LexisNexis rejected the details (no match found)
+
+        HTTP 200 is returned for all three outcomes. HTTP 500 is returned when the LexisNexis
+        call itself fails (non-2xx from LexisNexis). The response status field is absent on
+        HTTP 500 (only errors array is populated).
+
+        **Source**: `BankDetailsController.java`, `LexisNexisAccountValidationService.java`,
+        `LexisNexisResponseConverter.java`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidationRequest'
+            examples:
+              ukPersonal:
+                summary: UK personal account — sort code validation
+                value:
+                  account:
+                    accountType: UK_PERSONAL
+                    name: John Doe
+                    number: '12345678'
+                    bank:
+                      sortCode: '123456'
+                  country:
+                    code: GBR
+                    currency: GBP
+              euAccount:
+                summary: EU IBAN account — IBAN takes precedence over number
+                value:
+                  account:
+                    accountType: EU
+                    name: Jane Smith
+                    iban: PT392831273127334616
+                    bank:
+                      swiftCode: ABCDPTPL
+                  country:
+                    code: IRL
+                    currency: EUR
+      responses:
+        '200':
+          description: |
+            Validation executed. HTTP 200 is returned for all three outcomes. Check `status`:
+            MATCH = full match; PARTIAL_MATCH = partial match; FAILED = no match.
+            `bankName` is populated on MATCH and PARTIAL_MATCH responses.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankDetailsResponse'
+              examples:
+                match:
+                  summary: Full match
+                  value:
+                    status: MATCH
+                    message: All details match
+                    bankName: Acme Bank
+                partialMatch:
+                  summary: Partial match
+                  value:
+                    status: PARTIAL_MATCH
+                    message: Name partially matched
+                    bankName: Acme Bank
+                failed:
+                  summary: No match
+                  value:
+                    status: FAILED
+                    message: Account not found
+                    errors:
+                      - code: 1
+                        description: No matching account found
+        '500':
+          description: |
+            LexisNexis returned a non-2xx response or an unexpected error occurred.
+            The errors array will be populated; the status field will be absent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankDetailsResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+  /bank-details-validator-service/v1/country-currency/all:
+    get:
+      tags:
+        - reference
+      summary: Retrieve all country codes and currencies from LexisNexis
+      operationId: getCountryAndCurrency
+      description: |
+        Returns a map of country code strings to currency code strings as provided by the
+        LexisNexis SafePayment system. No request parameters are required. HTTP 500 indicates
+        a LexisNexis call failure.
+
+        The country code format (alpha-2 vs alpha-3) depends entirely on what LexisNexis returns.
+        Use the keys from this response when populating `country.code` in validation requests.
+
+        **Source**: `InformationController.java`
+      responses:
+        '200':
+          description: Country-currency map returned from LexisNexis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountriesCurrencyResponse'
+              examples:
+                sample:
+                  summary: Example subset (LexisNexis-dependent values)
+                  value:
+                    countriesCurrency:
+                      GB: GBP
+                      IE: EUR
+                      PT: EUR
+                      US: USD
+        '500':
+          description: Downstream LexisNexis call failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountriesCurrencyResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+components:
+  schemas:
+    ValidationRequest:
+      type: object
+      x-validation-source: ValidationRequest.java
+      description: |
+        Bank details validation request. No JSR-303 annotations are present. All field
+        validation is delegated to LexisNexis. Only `account.bank.sortCode` and
+        `account.iban`/`account.number` are forwarded to LexisNexis — other fields in
+        AccountDetails are not included in the LexisNexis request body.
+      properties:
+        account:
+          $ref: '#/components/schemas/AccountDetails'
+        country:
+          $ref: '#/components/schemas/CountryDetails'
+
+    AccountDetails:
+      type: object
+      x-validation-source: AccountDetails.java
+      description: |
+        Bank account details. No JSR-303 annotations present. `name` is a plain string.
+        For UK accounts: provide number + bank.sortCode (sortCode is sent as `nationalId`
+        to LexisNexis). For EU/international: provide iban (takes precedence over number
+        when both are supplied).
+      properties:
+        accountType:
+          type: string
+          description: Account classification.
+          enum:
+            - EU
+            - UK_PERSONAL
+            - UK_BUSINESS
+        name:
+          type: string
+          description: |
+            Account holder full name as a plain string (e.g. "John Doe"). Not forwarded
+            to LexisNexis in the verification request — used for display/logging only.
+        number:
+          type: string
+          description: UK account number. Used as LexisNexis `accountNumber` when iban is blank.
+        iban:
+          type: string
+          description: |
+            IBAN for EU/international accounts. Takes precedence over number when forwarding
+            to LexisNexis — if iban is non-blank, it is sent as `accountNumber` instead of number.
+        buildingSocietyRollNumber:
+          type: string
+          description: Optional building society roll number. Not forwarded to LexisNexis.
+        bank:
+          $ref: '#/components/schemas/BankDetails'
+
+    BankDetails:
+      type: object
+      x-validation-source: BankDetails.java
+      description: Bank identifiers. sortCode is the primary field used in the LexisNexis request.
+      properties:
+        name:
+          type: string
+          description: Bank name. Not forwarded to LexisNexis.
+        sortCode:
+          type: string
+          description: |
+            UK 6-digit sort code (digits only). Forwarded to LexisNexis as `nationalId`.
+            Required for UK account validation; omit for EU/international IBAN-only accounts.
+        swiftCode:
+          type: string
+          description: SWIFT/BIC code. Not forwarded directly to LexisNexis in the current implementation.
+
+    CountryDetails:
+      type: object
+      x-validation-source: CountryDetails.java
+      description: Country and currency for the account. No validation annotations present.
+      properties:
+        code:
+          type: string
+          description: |
+            Country code. Forwarded to LexisNexis as `countryCode`. Use the values returned
+            by GET /bank-details-validator-service/v1/country-currency/all.
+        currency:
+          type: string
+          description: Currency code.
+          enum:
+            - EUR
+            - GBP
+
+    BankDetailsResponse:
+      type: object
+      x-validation-source: BankDetailsResponse.java, AccountDetailsResponse.java, ValidationResponse.java
+      description: |
+        Response from the validate endpoint. Extends AccountDetailsResponse which extends
+        ValidationResponse. On HTTP 200 the `status` field is always present. On HTTP 500
+        (LexisNexis failure) only the `errors` array is populated.
+      properties:
+        status:
+          type: string
+          description: |
+            Validation outcome from LexisNexis. MATCH = full match; PARTIAL_MATCH = partial
+            match; FAILED = no match found.
+          enum:
+            - MATCH
+            - PARTIAL_MATCH
+            - FAILED
+        message:
+          type: string
+          description: Human-readable validation message from LexisNexis.
+        bankName:
+          type: string
+          description: Bank name resolved by LexisNexis. Present on MATCH and PARTIAL_MATCH; absent on FAILED.
+        errors:
+          type: array
+          description: Error entries. Populated on FAILED outcomes and HTTP 500.
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    CountriesCurrencyResponse:
+      type: object
+      x-validation-source: CountriesCurrencyResponse.java
+      properties:
+        countriesCurrency:
+          type: object
+          description: |
+            Map of country code to currency code. Keys and values depend on the LexisNexis
+            response. No static enumeration is possible.
+          additionalProperties:
+            type: string
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    ResponseError:
+      type: object
+      x-validation-source: ResponseError.java
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: Error code (HTTP status code or LexisNexis error code).
+        description:
+          type: string
+          description: Human-readable error description.

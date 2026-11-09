@@ -1,0 +1,392 @@
+openapi: '3.0.1'
+info:
+  title: Message Service
+  version: v1
+  x-source-repository: message-service
+  description: |
+    Dropwizard/Spring hybrid service that creates, retrieves, and deletes portal
+    notification messages. Messages are created in batch with validation and DLQ
+    (Dead Letter Queue) support for failed messages.
+
+    **Upstream consumers**: Notification flows from multiple CAPD services.
+    **Downstream dependencies**:
+    - Message database (Hibernate/Spring JPA)
+    - DLQ database table for failed messages
+
+    **Authentication**: `callerId` and `userType` headers accepted but not
+    validated — no authorisation scheme is formally enforced.
+
+    **Batch processing**:
+    - Messages that fail validation are written to the DLQ (`message_dlq` table).
+    - Valid messages are processed by `MessageProcessor`.
+    - If ALL messages fail validation, HTTP 200 is still returned with
+      `MessageResponse.successful=false` (not HTTP 400). Only `messages == null`
+      triggers HTTP 400.
+
+    **`title` and `body` fields**: The `Message` DTO has `@JsonProperty` and
+    `@JsonIgnore` annotations on these fields simultaneously. `@JsonIgnore`
+    takes precedence — these fields are **excluded** from serialisation. They
+    cannot be submitted via the API.
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: messages
+    description: Message lifecycle operations
+  - name: status
+    description: Application health check
+
+paths:
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application health check
+      operationId: getStatus
+      description: Returns plain text indicating service health.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /messages:
+    post:
+      tags:
+        - messages
+      summary: Create messages in batch
+      operationId: create
+      description: |
+        Accepts a batch of messages for creation. Each message is independently validated
+        before processing. Failed messages are written to the DLQ; valid ones are processed
+        by `MessageProcessor`.
+
+        **Validation**:
+        1. `messageRequest.messages == null` → HTTP 400, body: `"Empty messages"`
+        2. Per-message validation via `MessageValidatorFactory` — invalid messages go to
+           DLQ and do not block valid messages.
+        3. If ALL messages fail validation → HTTP 200, `successful=false`, `responseText`
+           contains concatenated validation failure messages.
+
+        **Required fields per message** (enforced by `MessageValidator`):
+        - `createdOn` — must not be null
+        - `createdByUserId` — must not be null
+        - `sentByEmail` — must not be null
+        - `sentByNotification` — must not be null
+        - `originatingSystem` — must not be null; must be `RuralPayments` or `SitiAgri`
+        - `type` — **conditionally required**: must not be null when
+          `originatingSystem=RuralPayments`. Optional when `originatingSystem=SitiAgri`.
+
+        **Message-type-specific validators**: `MessageValidatorFactory` selects a
+        type-specific validator (30+ implementations) based on the `type` field.
+        Each validator applies additional rules to `params`, `personIds`, and other
+        fields. Failures are written to the DLQ with a descriptive reason.
+
+        **On HTTP 200 (partial success)**: Some messages may have been written to DLQ.
+        Check `successful` field in response. `ids` contains IDs of successfully processed
+        messages only.
+
+        **Processed response**: `responseText="Success"`, `successful=true`, `ids` =
+        list of processed message IDs.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageRequest'
+      responses:
+        '200':
+          description: |
+            Messages processed. Check `successful` field — if false, all messages failed
+            validation and were written to DLQ.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              examples:
+                success:
+                  value:
+                    responseText: Success
+                    ids: [42, 43]
+                    successful: true
+                allFailed:
+                  value:
+                    responseText: 'Validation of all message requests failed: ...'
+                    ids: [null, null]
+                    successful: false
+        '400':
+          description: |
+            `messages` array is null in the request body. Body: plain text "Empty messages".
+          content:
+            text/plain:
+              schema:
+                type: string
+
+    delete:
+      tags:
+        - messages
+      summary: Delete messages by IDs from query parameters
+      operationId: delete
+      description: |
+        Deletes messages whose IDs are provided as query parameters. The implementation reads
+        all query parameters from the HTTP request via `request.getParameterMap()` and
+        extracts IDs. Accepts both `id` and `messageId` parameter names.
+
+        **Example call**: `DELETE /messages?id=1&id=3&id=7&messageId=3`
+
+        **Behaviour**: Each ID is resolved individually from the database. If an ID does not
+        exist, `messageDao.get(id)` returns null and `messageDao.delete(null)` is called —
+        behaviour is implementation-dependent (typically no-op). No error is thrown for
+        missing IDs.
+
+        **Returns HTTP 204** (No Content) on success — not HTTP 200 as suggested by the
+        original Swagger spec.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: id
+          in: query
+          required: false
+          description: |
+            Message ID(s) to delete. Can be repeated multiple times. Also accepts
+            `messageId` as an alternative parameter name.
+          schema:
+            type: array
+            items:
+              type: integer
+          style: form
+          explode: true
+      responses:
+        '204':
+          description: Messages deleted successfully (no content returned)
+
+  /messages/{id}:
+    get:
+      tags:
+        - messages
+      summary: Retrieve a message by ID
+      operationId: get
+      description: |
+        Retrieves a single message from the database by its `id`. The returned `Message`
+        is converted from the Hibernate domain object to the API DTO via `MessageConverter`.
+
+        **Note on `title` and `body` fields**: These fields are annotated with both
+        `@JsonProperty` and `@JsonIgnore` on the `Message` DTO. `@JsonIgnore` takes
+        precedence and these fields are **not serialised** in the response.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: id
+          in: path
+          required: true
+          description: Message identifier (BigInteger)
+          schema:
+            type: integer
+          example: 12
+      responses:
+        '200':
+          description: Message found and returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '404':
+          description: Message not found (message is null in database)
+
+  /messages/clean-dlq:
+    delete:
+      tags:
+        - messages
+      summary: Delete DLQ messages older than a retention timestamp
+      operationId: cleanDLQ
+      description: |
+        Deletes all entries from the `message_dlq` table where the record timestamp is older
+        than `timestamp`. Intended for scheduled cleanup.
+
+        **Timestamp format**: `yyyyMMddHHmmss` (parsed by `DateTimeFormatter` — exact format
+        is strict). An unparseable timestamp causes a `DateTimeParseException` (HTTP 500).
+
+        **Validation**: `timestamp == null` → HTTP 400, body: "Empty timestamp".
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: timestamp
+          in: query
+          required: true
+          description: |
+            Retention date — DLQ entries older than this timestamp are deleted.
+            Format: `yyyyMMddHHmmss` (e.g. `20200101190000`).
+          schema:
+            type: string
+            pattern: '^\d{14}$'
+            example: '20200101190000'
+      responses:
+        '200':
+          description: DLQ cleaned successfully
+        '400':
+          description: Timestamp query parameter is null
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: Empty timestamp
+        '500':
+          description: |
+            Timestamp format is invalid. The value must be exactly `yyyyMMddHHmmss`
+            (e.g. `20200101190000`). Any other format causes a `DateTimeParseException`
+            which propagates as HTTP 500 with a stack trace.
+
+  /messages/dlq:
+    post:
+      tags:
+        - messages
+      summary: Save a message directly to the DLQ
+      operationId: saveInDLQ
+      description: |
+        Persists a single message to the Dead Letter Queue (`message_dlq` table) with a
+        provided failure reason. Used by upstream services to explicitly park failed messages
+        for later inspection.
+
+        **Note**: This endpoint is not present in the original Swagger 2.0 spec but exists
+        in source (`MessageResource.java`).
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - name: reason
+          in: query
+          required: true
+          description: Human-readable failure reason for the DLQ entry
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Message'
+      responses:
+        '200':
+          description: Message saved to DLQ successfully
+
+components:
+  parameters:
+    callerId:
+      name: callerId
+      in: header
+      required: false
+      description: Internal CAPD caller identifier (BigInteger)
+      schema:
+        type: integer
+    userType:
+      name: userType
+      in: header
+      required: false
+      description: User type classification
+      schema:
+        type: string
+
+  schemas:
+    MessageRequest:
+      type: object
+      x-validation-source: MessageRequest.java
+      description: Batch message creation request.
+      properties:
+        messages:
+          type: array
+          description: |
+            List of messages to create. Must not be null (HTTP 400 if null).
+            An empty array is accepted but produces an empty response.
+          items:
+            $ref: '#/components/schemas/Message'
+
+    MessageResponse:
+      type: object
+      x-validation-source: MessageResponse.java
+      description: |
+        Result of a batch message create operation. `successful=true` means all valid
+        messages were processed. `successful=false` means all messages failed validation.
+        Mixed results (some succeeded) return `successful=true` with `ids` containing only
+        successfully processed message IDs.
+      properties:
+        responseText:
+          type: string
+          description: |
+            Status message. `"Success"` on complete success. Concatenated validation errors
+            on complete failure.
+        ids:
+          type: array
+          description: IDs of successfully processed messages (or input IDs on failure)
+          items:
+            type: integer
+        successful:
+          type: boolean
+          description: True if at least one message was processed successfully
+
+    Message:
+      type: object
+      x-validation-source: Message.java
+      description: |
+        A portal notification message. The `title` and `body` fields are annotated with both
+        `@JsonProperty` and `@JsonIgnore` — `@JsonIgnore` wins and these fields are
+        **excluded from serialisation** (not present in API responses or request bodies).
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Unique message identifier (BigInteger). Assigned by the database.
+        externalSystemId:
+          type: integer
+          format: int64
+          description: Identifier of the external system that originated the message
+        personIds:
+          type: array
+          description: List of person identifiers to receive this message
+          items:
+            type: integer
+            format: int64
+        organisationId:
+          type: integer
+          format: int64
+          description: Organisation identifier associated with this message
+        type:
+          type: string
+          description: |
+            Message type classifier. **Conditionally required**: must be provided when
+            `originatingSystem=RuralPayments`. Used by `MessageValidatorFactory` to
+            select a type-specific validator (30+ implementations).
+        createdByUserId:
+          type: integer
+          format: int64
+          description: Identifier of the user who created the message. **Required** (must not be null).
+        createdOn:
+          type: string
+          format: date-time
+          description: Timestamp when the message was created (java.sql.Timestamp — ISO 8601). **Required** (must not be null).
+        sentByEmail:
+          type: boolean
+          description: Whether this message was dispatched via email. **Required** (must not be null).
+        sentByNotification:
+          type: boolean
+          description: Whether this message was dispatched via portal notification. **Required** (must not be null).
+        originatingSystem:
+          type: string
+          description: |
+            The originating system of the message. **Required** (must not be null).
+            When `RuralPayments`, the `type` field is also required.
+          enum:
+            - RuralPayments
+            - SitiAgri
+        params:
+          type: object
+          description: Arbitrary additional parameters as key-value pairs
+          additionalProperties: {}
+        isRead:
+          type: boolean
+          description: Whether the message has been read by the recipient

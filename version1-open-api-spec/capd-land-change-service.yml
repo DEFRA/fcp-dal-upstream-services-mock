@@ -1,0 +1,494 @@
+openapi: '3.0.1'
+info:
+  title: CAPD Land Change Service
+  version: v1
+  x-source-repository: capd-land-change-service
+  description: |
+    Orchestrates land change submissions for the Rural Payments portal. Accepts land cover
+    change requests from portal users, validates the payload, moves associated documents
+    from temporary storage to Azure Blob Storage, submits the change to LMS (Land Management
+    System), and persists submission history.
+
+    **Upstream consumers**: Portal front-end, capd-frontends.
+    **Downstream dependencies**:
+    - capd-file-handler-service — moves temp documents to Azure permanent storage
+    - LMS (Land Management System) — receives the final change submission
+    - CAPD_LAND database schema — persists submission history (HISTORY table)
+
+    **Authentication**: No authentication scheme declared in this service.
+
+    **Submission flow** (from `LandChangeService.submit()`):
+    1. `LandChangeValidator.validate()` — pre-conditions checked (see POST endpoint for detail)
+    2. `CapdFileHandlerService.moveToPermanent()` — calls capd-file-handler-service POST /file-handler/v1/azure/upload
+    3. `SubmitChangeService.submitChange()` — sends change to LMS
+    4. `SaveSubmissionInformationService.save()` — persists to CAPD_LAND.HISTORY
+    5. Returns HTTP 202 on success
+
+    **Error codes** (from `ResponseErrorCodes.java`):
+    - 10 = UNABLE_TO_SAVE — failed to persist to database
+    - 20 = MANDATORY_DATA_MISSING — required field absent in request
+    - 30 = UNAUTHORIZED_USER_TYPE — caller is `internal` user type
+
+servers:
+  - url: http://localhost:9033
+    description: Local development server (port 9033)
+
+tags:
+  - name: land-change
+    description: Land change submission and reference data
+  - name: history
+    description: Submission history retrieval
+
+paths:
+  /land-change/v1/land/change:
+    post:
+      tags:
+        - land-change
+      summary: Submit a land change to LMS
+      operationId: submitLandChange
+      description: |
+        Validates and submits a land cover change request. Processing occurs in three
+        sequential phases (all synchronous):
+        1. Local validation (`LandChangeValidator`) — short-circuits to HTTP 400 on failure
+        2. Azure file move (`CapdFileHandlerService`) — calls capd-file-handler-service
+        3. LMS submission (`SubmitChangeService`) + history save
+
+        **Validation rules** (from `LandChangeValidator.java`):
+
+        All validations are accumulated — multiple errors can be returned in one response.
+        Each failed check adds a `ResponseError` with code 20 (MANDATORY_DATA_MISSING)
+        or code 30 (UNAUTHORIZED_USER_TYPE).
+
+        1. **Internal user check**: If header `userType` = `internal`, error is added:
+           code 30, "User type 'internal' isn't authorized to make submissions"
+
+        2. **personId**: If null → code 20, "Person id is missing"
+
+        3. **organisationId**: If null → code 20, "Organisation id is missing"
+
+        4. **parcels**: If null or empty → code 20, "Parcels information is missing".
+           Otherwise, for each parcel:
+           - If all parcel fields are blank/null (`parcel.isEmpty()`) → code 20, "Parcel information is missing"
+           - If `parcelId` is null/blank → code 20, "Parcel id is missing"
+           - If `sheetId` is null/blank → code 20, "Sheet id is missing"
+           - If `effectiveDate` is null → code 20, "Effective Date is missing"
+           - If `coverChange` is present AND both `currentCoverTypeCode` and `currentCoverTypeName` are empty → code 20, "Current cover type is missing"
+           - If `coverChange` is present AND both `newCoverTypeCode` and `newCoverTypeName` are empty → code 20, "New cover type is missing"
+
+        5. **crn**: If null → code 20, "CRN is missing"
+
+        **Not validated** (no server-side check): `changeType`, `sbi`, `frn`, `schemes`,
+        `documents`. These can be absent or null without triggering validation errors.
+
+        **HTTP 202**: Submission accepted, documents moved to Azure, LMS notified, history saved.
+        **HTTP 400**: One or more validation errors. Errors accumulated and returned together.
+        **HTTP 500**: Unexpected error at any phase (Azure, LMS, or DB).
+
+        **Note on original spec**: The original spec declared HTTP 201; the controller
+        actually returns `HttpStatus.ACCEPTED` = HTTP 202.
+
+        **Source**: `LandChangeController.java`, `LandChangeValidator.java`,
+        `LandChangeService.java`
+      parameters:
+        - name: userType
+          in: header
+          required: false
+          description: |
+            Caller user type. If `internal`, request is rejected (code 30). Other values
+            and absent header are permitted.
+          schema:
+            type: string
+            enum:
+              - internal
+              - external
+              - ida_no_match
+      requestBody:
+        required: true
+        description: Land change submission payload
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LandChangeRequest'
+            examples:
+              landCoverChange:
+                summary: Land cover change with two parcels
+                value:
+                  changeType: LANDCOVER_CHANGE
+                  organisationId: 123
+                  personId: 567
+                  sbi: 823456789
+                  frn: 99998888
+                  crn: 654321
+                  parcels:
+                    - parcelId: P123
+                      sheetId: SH12
+                      effectiveDate: '20/03/2023'
+                      coverChange:
+                        currentCoverTypeName: Permanent Grassland
+                        newCoverTypeName: Arable
+                    - parcelId: P321
+                      sheetId: SH12
+                      effectiveDate: '20/03/2023'
+                      coverChange:
+                        currentCoverTypeName: Permanent Grassland
+                        newCoverTypeName: Arable
+                  schemes:
+                    - schemeA
+                  documents:
+                    - doc1a
+      responses:
+        '202':
+          description: |
+            Land change accepted. Documents moved to Azure, LMS notified, history saved.
+            Response body is an empty JSON object `{}`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LandChangeResponse'
+              examples:
+                accepted:
+                  value: {}
+        '400':
+          description: |
+            Validation failed. One or more errors in the `errors` array. Error codes:
+            - 30 = UNAUTHORIZED_USER_TYPE (userType is internal)
+            - 20 = MANDATORY_DATA_MISSING (required field absent or invalid)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LandChangeResponse'
+              examples:
+                unauthorized:
+                  summary: Internal user type
+                  value:
+                    errors:
+                      - code: 30
+                        description: "User type 'internal' isn't authorized to make submissions"
+                mandatoryMissing:
+                  summary: Multiple mandatory fields missing
+                  value:
+                    errors:
+                      - code: 20
+                        description: Person id is missing
+                      - code: 20
+                        description: CRN is missing
+                parcelErrors:
+                  summary: Parcel validation errors
+                  value:
+                    errors:
+                      - code: 20
+                        description: Parcel id is missing
+                      - code: 20
+                        description: Effective Date is missing
+        '500':
+          description: Unexpected service error (Azure, LMS, or DB failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LandChangeResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+  /land-change/v1/land/cover/types:
+    get:
+      tags:
+        - land-change
+      summary: List all available land cover types
+      operationId: getLandCoverTypes
+      description: |
+        Returns a sorted list of all land cover type names from the COVER_TYPE database
+        table (CAPD_LAND schema). Used by the portal to populate cover type selection
+        dropdowns.
+
+        **Source**: `LandChangeController.java`, `LandCoverTypeService.java`,
+        `CoverTypeRepository.java`
+      responses:
+        '200':
+          description: List of land cover type names, sorted alphabetically
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+              examples:
+                types:
+                  summary: Sample land cover types
+                  value:
+                    - Arable Land
+                    - Bracken
+                    - Freshwater
+                    - Permanent Crops
+                    - Permanent Grassland
+                    - Woodland
+        '500':
+          description: Unexpected service error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LandChangeResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+  /land-change/v1/history/{organisationId}:
+    get:
+      tags:
+        - history
+      summary: Retrieve submitted land changes for an organisation
+      operationId: getHistory
+      description: |
+        Returns all previously submitted land changes for a given organisationId, read
+        from the CAPD_LAND database schema (HISTORY, DETAILS, DOCUMENT tables). Each
+        record includes the submission date, change type, affected parcels, and uploaded
+        documents.
+
+        **Date formats**: All dates in the response (`submissionDate`, `effectiveDate`,
+        `uploadDate`) are serialised as `dd/MM/yyyy` strings (via `@JsonFormat`).
+
+        **Source**: `HistoryController.java`, `HistoryService.java`,
+        `HistoryRepository.java`
+      parameters:
+        - name: organisationId
+          in: path
+          required: true
+          description: Organisation identifier. Filters history records for this organisation.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Submitted land changes for the given organisation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmittedChangesResponse'
+              examples:
+                history:
+                  value:
+                    changeRequest:
+                      - submissionId: '12345'
+                        submissionDate: '20/01/2022'
+                        changeType: BOUNDARY
+                        parcelDetails:
+                          - parcelId: id12
+                            sheetId: sheetid12
+                            effectiveDate: '20/01/2022'
+                            coverChange:
+                              currentCoverTypeName: ARABLE
+                              newCoverTypeName: PERMANENT_PASTURE
+                        documents:
+                          - name: postcard.pdf
+                            uploadDate: '20/01/2022'
+        '500':
+          description: Unexpected service error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmittedChangesResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+components:
+  schemas:
+    LandChangeRequest:
+      type: object
+      x-validation-source: LandChangeRequest.java, LandChangeValidator.java
+      description: |
+        Land cover change submission payload. Only `personId`, `organisationId`, `crn`,
+        and `parcels` are server-validated. `changeType`, `sbi`, `frn`, `schemes`,
+        `documents` are not validated and can be absent.
+      required:
+        - personId
+        - organisationId
+        - crn
+        - parcels
+      properties:
+        changeType:
+          type: string
+          description: Change category code (e.g. LANDCOVER_CHANGE, BOUNDARY_CHANGE). Not validated by server.
+          example: LANDCOVER_CHANGE
+        organisationId:
+          type: integer
+          format: int64
+          description: Internal organisation identifier (Long). Required — null triggers code 20 error.
+        personId:
+          type: integer
+          format: int64
+          description: Internal person identifier (Long). Required — null triggers code 20 error.
+        sbi:
+          type: integer
+          format: int64
+          description: Single Business Identifier. Optional — not validated by server. Used in Azure file upload.
+        frn:
+          type: integer
+          format: int64
+          description: Firm Reference Number. Optional — not validated by server.
+        crn:
+          type: integer
+          format: int64
+          description: Customer Reference Number. Required — null triggers code 20 error.
+        parcels:
+          type: array
+          description: |
+            List of affected parcels. Required — null/empty triggers code 20 error.
+            Each parcel is individually validated (see parcel schema).
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Parcel'
+        schemes:
+          type: array
+          description: Scheme codes associated with this change. Optional — not validated.
+          items:
+            type: string
+        documents:
+          type: array
+          description: |
+            Filenames of documents previously uploaded to temporary storage via
+            capd-file-handler-service. Optional — not validated by this service.
+          items:
+            type: string
+
+    Parcel:
+      type: object
+      x-validation-source: Parcel.java, LandChangeValidator.java
+      description: |
+        An affected land parcel. `parcelId`, `sheetId`, and `effectiveDate` are all
+        required. `coverChange` is optional — if provided, at least one of code or name
+        must be set for both current and new cover types.
+      required:
+        - parcelId
+        - sheetId
+        - effectiveDate
+      properties:
+        parcelId:
+          type: string
+          description: Parcel identifier. Required — blank triggers code 20 error.
+        sheetId:
+          type: string
+          description: OS map sheet identifier. Required — blank triggers code 20 error.
+        effectiveDate:
+          type: string
+          description: |
+            Date the change takes effect. Format: dd/MM/yyyy (from
+            @JsonFormat(pattern="dd/MM/yyyy") on Parcel.effectiveDate). Required — null
+            triggers code 20 error.
+          example: '20/03/2023'
+        coverChange:
+          $ref: '#/components/schemas/LandCoverChange'
+
+    LandCoverChange:
+      type: object
+      x-validation-source: LandCoverChange.java, LandChangeValidator.java
+      description: |
+        Describes a land cover change for a parcel. Optional in the parent parcel.
+        If provided: at least one of `currentCoverTypeCode` or `currentCoverTypeName`
+        must be non-empty (both empty triggers code 20, "Current cover type is missing").
+        At least one of `newCoverTypeCode` or `newCoverTypeName` must be non-empty
+        (both empty triggers code 20, "New cover type is missing").
+      properties:
+        currentCoverTypeName:
+          type: string
+          description: Name of the current land cover type. At least one of code/name required.
+        currentCoverTypeCode:
+          type: string
+          description: Code of the current land cover type. At least one of code/name required.
+        newCoverTypeName:
+          type: string
+          description: Name of the new land cover type. At least one of code/name required.
+        newCoverTypeCode:
+          type: string
+          description: Code of the new land cover type. At least one of code/name required.
+
+    LandChangeResponse:
+      type: object
+      x-validation-source: LandChangeResponse.java
+      description: |
+        Generic service response. `accepted()` method returns true if errors is empty.
+        The controller returns HTTP 202 when accepted, HTTP 400 otherwise.
+        `azureId` is only populated on internal paths.
+      properties:
+        azureId:
+          type: string
+          description: Azure folder ID — internal field, not typically present in external responses.
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    SubmittedChangesResponse:
+      type: object
+      x-validation-source: SubmittedChangesResponse.java
+      description: History response payload containing a list of previously submitted changes.
+      properties:
+        changeRequest:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChangeRequestResponse'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    ChangeRequestResponse:
+      type: object
+      x-validation-source: ChangeRequestResponse.java
+      description: A single historical submission record.
+      properties:
+        submissionId:
+          type: string
+          description: Unique submission identifier (from HISTORY.ID, returned as string).
+        submissionDate:
+          type: string
+          description: Date of submission. Format dd/MM/yyyy (from @JsonFormat(pattern="dd/MM/yyyy")).
+          example: '20/01/2022'
+        changeType:
+          type: string
+          description: Change type code (e.g. BOUNDARY, LANDCOVER_CHANGE).
+        parcelDetails:
+          type: array
+          description: Parcels included in the submission. Uses Parcel DTO; dates in dd/MM/yyyy format.
+          items:
+            $ref: '#/components/schemas/Parcel'
+        documents:
+          type: array
+          description: Documents uploaded with this submission.
+          items:
+            $ref: '#/components/schemas/SubmittedDocument'
+
+    SubmittedDocument:
+      type: object
+      x-validation-source: SubmittedDocuments.java
+      description: A document associated with a historical submission.
+      properties:
+        name:
+          type: string
+          description: Original filename of the document.
+        uploadDate:
+          type: string
+          description: Date the document was uploaded. Format dd/MM/yyyy (from @JsonFormat(pattern="dd/MM/yyyy")).
+          example: '20/01/2022'
+
+    ResponseError:
+      type: object
+      x-validation-source: ResponseError.java
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: |
+            Error code. Known values: 10=UNABLE_TO_SAVE, 20=MANDATORY_DATA_MISSING,
+            30=UNAUTHORIZED_USER_TYPE, 500=unexpected service error.
+        description:
+          type: string
+          description: Human-readable error message.

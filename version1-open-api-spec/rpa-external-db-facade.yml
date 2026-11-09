@@ -1,0 +1,213 @@
+openapi: '3.0.1'
+info:
+  title: CAPD External Database Facade Service
+  version: v1
+  x-source-repository: capd-externaldb-facade
+  description: |
+    Dropwizard/Hibernate/Jersey service providing a read-only facade over the CAPD
+    Oracle database for external consumer use cases.
+
+    **Purpose**:
+    1. Expose BPS application statuses per organisation from the legacy CAPD database.
+    2. Provide embedded-screen parameters (Siti Agri/Italian system integration identifiers)
+       for a given Firm Reference Number (FRN) and year.
+
+    **Database**: Oracle — read-only queries (`@UnitOfWork(readOnly=true)` on all endpoints).
+
+    **Authentication/Authorisation**:
+    - `GET /applications/statuses` requires `@CapdOrganisationAuthorisation(functions =
+      "viewBusinessDetails")` — callers must have the `viewBusinessDetails` function on
+      the requested organisation(s).
+    - `GET /embedded-screens/params/{frn}` has no authorisation annotation.
+
+    **Response envelope**: All successful JSON responses are wrapped in a `CapdResponse`
+    envelope with a single `_data` field.
+
+    **404 handling**: Custom `NotFoundExceptionMapper` maps `NotFoundException` → HTTP 404
+    with plain text entity (`exception.getMessage()`).
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: applications
+    description: BPS application status queries
+  - name: embedded-screens
+    description: Embedded screen (Siti Agri) parameters
+
+paths:
+  /applications/statuses:
+    get:
+      tags:
+        - applications
+      summary: Get BPS application statuses for organisations
+      operationId: getApplicationStatuses
+      description: |
+        Returns the **most recent** BPS application status for each of the requested
+        `organisationId[]` values. One result entry is returned per requested organisation
+        ID — organisations with no applications receive status `NoApplications`.
+
+        **Authorisation**: `@CapdOrganisationAuthorisation(functions = "viewBusinessDetails")`
+        — the calling user must have the `viewBusinessDetails` CAPD function against the
+        requested organisation(s). Failure → HTTP 403 (from the authorisation filter).
+
+        **Validation**:
+        - `organisationId[]` missing or empty → HTTP 400
+
+        **Query**: Fetches all BPS applications for the supplied organisation IDs and
+        selects the most recently created application per organisation (by `createdAt`).
+        If no application exists for an org, a synthetic `NoApplications` entry is returned.
+
+        **Response**: `CapdResponse<Stream<ApplicationStatusForOrganisation>>` — one entry
+        per requested organisation ID.
+      parameters:
+        - name: organisationId[]
+          in: query
+          required: false
+          description: |
+            One or more CAPD organisation IDs. Must provide at least one value → else HTTP 400.
+            Repeat the parameter for multiple organisations.
+          schema:
+            type: array
+            items:
+              type: integer
+          style: form
+          explode: true
+          example: 123456789 # sfd-id-check: allow - organisation ID
+      responses:
+        '200':
+          description: |
+            Application statuses for requested organisations. One entry per `organisationId`.
+            Wrapped in `CapdResponse._data`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseApplicationStatusList'
+        '400':
+          description: No `organisationId[]` values provided
+        '403':
+          description: Caller does not have `viewBusinessDetails` authorisation for the organisation
+
+  /embedded-screens/params/{frn}:
+    get:
+      tags:
+        - embedded-screens
+      summary: Get embedded screen parameters for an FRN
+      operationId: getEmbeddedScreenParams
+      description: |
+        Returns Siti Agri/Italian embedded-screen identifiers (`soggettoId`, `dossierId`,
+        `applicationModelId`, `profileModelId`) for a given FRN and BPS application year.
+
+        **FRN format**: The path parameter is enforced by JAX-RS regex
+        `[0-9]{9}[a-zA-Z0-9]` — exactly 9 digits followed by 1 alphanumeric character
+        (total 10 characters). Non-matching paths return HTTP 404 (no route match).
+
+        **Year default**: If `year` is not supplied, defaults to the current UTC year
+        (`ZonedDateTime.now(ZoneId.of("UTC")).getYear()`).
+
+        **No authorisation annotation** — no `@CapdOrganisationAuthorisation` on this endpoint.
+
+        **HTTP 404**: `NotFoundException` (not found in database) → plain text body.
+      parameters:
+        - name: frn
+          in: path
+          required: true
+          description: |
+            Firm Reference Number. JAX-RS path regex: `[0-9]{9}[a-zA-Z0-9]`.
+            Must be exactly 9 digits followed by 1 alphanumeric character (10 chars total).
+          schema:
+            type: string
+            pattern: '^[0-9]{9}[a-zA-Z0-9]$'
+            minLength: 10
+            maxLength: 10
+          example: '123456789A'
+        - name: year
+          in: query
+          required: false
+          description: |
+            BPS application year (e.g., 2024). Defaults to current UTC year if not supplied.
+          schema:
+            type: integer
+            format: int32
+          example: 2024
+      responses:
+        '200':
+          description: Embedded screen parameters for the FRN and year. Wrapped in `CapdResponse._data`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseEmbeddedScreenParams'
+        '404':
+          description: |
+            FRN not found in database (NotFoundException → NotFoundExceptionMapper → plain text).
+            Also returned if FRN path segment does not match the regex pattern (JAX-RS 404).
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  schemas:
+    ApplicationStatusForOrganisation:
+      type: object
+      x-validation-source: ApplicationStatusForOrganisation.java
+      description: Most recent BPS application status for a single organisation.
+      properties:
+        organisationId:
+          type: integer
+          description: CAPD organisation ID (BigInteger)
+        status:
+          type: string
+          description: |
+            Most recent BPS application status. `NoApplications` is returned synthetically
+            when no BPS applications exist for the organisation.
+          enum:
+            - NoApplications
+            - Received
+            - Processing
+            - Authorised
+        createdAt:
+          type: string
+          format: date-time
+          description: Timestamp of the application creation (`java.sql.Timestamp`). Null for NoApplications.
+
+    EmbeddedScreenParams:
+      type: object
+      x-validation-source: EmbeddedScreenParams.java
+      description: |
+        Siti Agri system identifiers for the embedded portal screens. All fields
+        are `Long` — null if the record is not found.
+      properties:
+        soggettoId:
+          type: integer
+          format: int64
+          description: Siti Agri soggetto (subject) identifier
+        dossierId:
+          type: integer
+          format: int64
+          description: Siti Agri dossier identifier
+        applicationModelId:
+          type: integer
+          format: int64
+          description: Siti Agri application model identifier
+        profileModelId:
+          type: integer
+          format: int64
+          description: Siti Agri profile model identifier
+
+    CapdResponseApplicationStatusList:
+      type: object
+      description: CapdResponse wrapper containing a list of ApplicationStatusForOrganisation
+      properties:
+        _data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApplicationStatusForOrganisation'
+
+    CapdResponseEmbeddedScreenParams:
+      type: object
+      description: CapdResponse wrapper containing EmbeddedScreenParams
+      properties:
+        _data:
+          $ref: '#/components/schemas/EmbeddedScreenParams'

@@ -1,5 +1,5 @@
 ARG PARENT_VERSION=3.2.4-node24.22.1
-ARG PORT=3000
+ARG PORT=3100
 ARG PORT_DEBUG=9229
 
 FROM defradigital/node-development:${PARENT_VERSION} AS development
@@ -12,10 +12,11 @@ ENV PORT=${PORT}
 EXPOSE ${PORT} ${PORT_DEBUG}
 
 COPY --chown=node:node package*.json ./
+COPY --chown=node:node .npmrc ./
 RUN npm install
-COPY --chown=node:node ./src ./src
+COPY --chown=node:node src ./src
 
-CMD [ "npm", "run", "docker:dev" ]
+CMD [ "./node_modules/.bin/nodemon", "--ext", "js,json", "--legacy-watch", "./src" ]
 
 FROM defradigital/node:${PARENT_VERSION} AS production
 ARG PARENT_VERSION
@@ -27,10 +28,12 @@ USER root
 RUN apk add --no-cache curl
 USER node
 
-COPY --from=development /home/node/package*.json ./
-COPY --from=development /home/node/src ./src/
+COPY package*.json ./
+COPY .npmrc ./
 
 RUN npm ci --omit=dev
+
+COPY src ./src
 
 ARG PORT
 ENV PORT=${PORT}

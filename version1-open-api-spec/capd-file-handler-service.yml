@@ -1,0 +1,554 @@
+openapi: '3.0.1'
+info:
+  title: CAPD File Handler Service
+  version: v1
+  x-source-repository: capd-file-handler-service
+  description: |
+    Manages file uploads for the Rural Payments portal land change flow. Provides three
+    distinct upload flows:
+
+    1. **Temporary storage** (`/file-handler/v1/temporary/upload`): Saves an uploaded file
+       to a temporary database table (TEMP_DOCUMENT) associated with an organisation and person.
+       Files are sent to capd-file-validator-service for AV scanning before being saved.
+
+    2. **Azure Blob upload** (`/file-handler/v1/azure/upload`): Reads files from temporary
+       storage and uploads them — along with a generated PDF summary and control file — to
+       Azure Blob Storage. Cleans up the temporary records after a successful upload.
+
+    3. **Internal Azure upload** (`/v1/internal/azure/upload`): Internal-use endpoint for
+       uploading a file directly to a named Azure Blob container, with optional AV scan.
+
+    **Upstream consumers**: capd-land-change-service, capd-frontends (portal).
+    **Downstream dependencies**:
+    - capd-file-validator-service — AV scanning proxy
+    - Azure Blob Storage — permanent file store
+
+    **Authentication**: No authentication scheme is declared in this service.
+
+    **Path ID parameters**: organisationId and personId path parameters are passed to
+    `Long.valueOf()` in the service layer. Non-numeric values will cause an exception
+    which surfaces as HTTP 500.
+
+    **Error codes** (from `ResponseErrorCodes.java`):
+    - 10 = UNABLE_TO_SAVE_DOC — exception saving file to temporary storage
+    - 11 = UNABLE_TO_FIND_DOC — requested fileName not found in temporary storage
+    - 12 = DUPLICATE_DOC_FOUND — file with same name already exists for this person/org
+    - 30 = FAILED_TO_UPLOAD_ALL_FILES — one or more files failed to upload to Azure
+    - 40 = UNAUTHORIZED_USER_TYPE — caller userType is `internal` (not permitted)
+
+servers:
+  - url: http://localhost:9031
+    description: Local development server (default port 9031)
+
+tags:
+  - name: temporary-storage
+    description: Temporary file storage (pre-Azure stage)
+  - name: azure-upload
+    description: Azure Blob Storage upload operations
+  - name: internal
+    description: Internal operations not for direct portal consumer use
+
+paths:
+  /file-handler/v1/temporary/upload/{organisationId}/{personId}:
+    post:
+      tags:
+        - temporary-storage
+      summary: Upload file to temporary storage with AV scan
+      operationId: temporaryUpload
+      description: |
+        Saves an uploaded file to the TEMP_DOCUMENT database table keyed by organisationId
+        and personId, after passing it through AV scanning.
+
+        **Validation rules** (enforced by `LandChangeTemporaryDocumentStorage`):
+
+        1. **Internal user check**: If the `userType` header is `internal`, the request is
+           rejected immediately with **HTTP 401** (Unauthorized), error code 40
+           (UNAUTHORIZED_USER_TYPE). Other userType values (external, ida_no_match) and
+           absent userType are permitted.
+
+        2. **Duplicate check**: If a file with the same original filename already exists in
+           TEMP_DOCUMENT for this personId + organisationId combination, the request is
+           rejected with HTTP 422, error code 12 (DUPLICATE_DOC_FOUND).
+
+        3. **AV scan**: The file is forwarded to capd-file-validator-service via
+           `CapdFileValidatorService`. A 400 response from the validator is treated as an
+           AV scan failure — the validator's errors are returned in the response (HTTP 422).
+
+        4. **Save**: If AV scan passes, the file is saved as a BLOB in TEMP_DOCUMENT with
+           organisationId, personId, fileName, uploadDate, and fileContent.
+
+        **Success response**: HTTP 200 with `id` set to the original filename
+        (i.e. `multipartFile.getOriginalFilename()`).
+
+        **HTTP 401**: userType is `internal` (error code 40 UNAUTHORIZED_USER_TYPE).
+        **HTTP 422**: One of the other conditions above failed. Error code identifies the cause.
+        **HTTP 500**: Unexpected exception (e.g. blob conversion failure, DB error).
+
+        **Source**: `TemporaryStorageController.java`, `LandChangeTemporaryDocumentStorage.java`
+      parameters:
+        - name: userType
+          in: header
+          required: false
+          description: |
+            Caller user category. If set to `internal`, the request is rejected with HTTP 422
+            (error code 40). Other values and absent header are permitted.
+          schema:
+            type: string
+            enum:
+              - internal
+              - external
+              - ida_no_match
+        - name: organisationId
+          in: path
+          required: true
+          description: Internal organisation identifier. Must be a numeric string parseable as Long.
+          schema:
+            type: string
+        - name: personId
+          in: path
+          required: true
+          description: Internal person identifier. Must be a numeric string parseable as Long.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file to upload. The original filename is used as the record identifier.
+      responses:
+        '200':
+          description: |
+            File saved to temporary storage. `id` contains the original filename as stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                saved:
+                  value:
+                    id: cover-letter.pdf
+        '401':
+          description: |
+            userType header is `internal` — not permitted to upload files.
+            Error code 40 (UNAUTHORIZED_USER_TYPE).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                unauthorizedUser:
+                  summary: Internal userType not permitted
+                  value:
+                    errors:
+                      - code: 40
+                        description: "User type 'internal' isn't authorized to upload files"
+        '422':
+          description: |
+            Validation failed or AV scan rejected the file. The error code identifies the cause:
+            - Code 12 (DUPLICATE_DOC_FOUND): file with same name already exists for this person/org
+            - AV validation errors: returned from capd-file-validator-service
+            - Code 10 (UNABLE_TO_SAVE_DOC): exception saving to TEMP_DOCUMENT table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                duplicateFile:
+                  summary: File already exists for this person/org
+                  value:
+                    errors:
+                      - code: 12
+                        description: File already exists
+                saveFailed:
+                  summary: Exception saving to database
+                  value:
+                    errors:
+                      - code: 10
+                        description: 'Unable to save temporary document'
+        '500':
+          description: Unexpected service error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+
+  /file-handler/v1/temporary/upload/{organisationId}/{personId}/{fileName}:
+    delete:
+      tags:
+        - temporary-storage
+      summary: Delete a specific temporary file
+      operationId: deleteTemporaryUploadFile
+      description: |
+        Deletes a single named file from TEMP_DOCUMENT for the given organisationId + personId
+        combination. Returns HTTP 202 on success. HTTP 500 on any exception (exceptions are
+        caught and silently converted to 500 — no error body is returned).
+
+        **Source**: `TemporaryStorageController.java` (deleteTemporaryUploadFile)
+      parameters:
+        - name: organisationId
+          in: path
+          required: true
+          description: Internal organisation identifier. Must be numeric parseable as Long.
+          schema:
+            type: string
+        - name: personId
+          in: path
+          required: true
+          description: Internal person identifier. Must be numeric parseable as Long.
+          schema:
+            type: string
+        - name: fileName
+          in: path
+          required: true
+          description: Exact filename as stored in TEMP_DOCUMENT (i.e. as returned by the temporary upload endpoint's `id` field).
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Deletion accepted and completed
+        '500':
+          description: Unexpected error — no body returned
+
+  /file-handler/v1/temporary/upload/{personId}:
+    delete:
+      tags:
+        - temporary-storage
+      summary: Delete all temporary files for a person
+      operationId: deleteTemporaryUploadFileByPersonId
+      description: |
+        Deletes ALL temporary files in TEMP_DOCUMENT associated with the given personId,
+        across all organisations. Returns HTTP 202 on success. HTTP 500 on any exception
+        (exceptions are caught and silently converted to 500 — no error body is returned).
+
+        **Source**: `TemporaryStorageController.java` (deleteTemporaryUploadFileByPersonId)
+      parameters:
+        - name: personId
+          in: path
+          required: true
+          description: Internal person identifier. All TEMP_DOCUMENT records for this personId will be deleted.
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Deletion accepted and completed
+        '500':
+          description: Unexpected error — no body returned
+
+  /file-handler/v1/azure/upload:
+    post:
+      tags:
+        - azure-upload
+      summary: Upload land change files from temporary storage to Azure Blob Storage
+      operationId: azureUpload
+      description: |
+        Reads files from TEMP_DOCUMENT by `fileNames` and uploads them to Azure Blob Storage
+        as part of a land change submission. Also uploads a generated PDF summary and a control
+        file. Cleans up TEMP_DOCUMENT records after a successful upload.
+
+        **Processing steps** (from `LandChangeAzureStorage`):
+
+        1. **Temp file lookup**: For each name in `fileNames`, the service looks up
+           TEMP_DOCUMENT by personId + organisationId + fileName. Any name not found results
+           in an error (code 11, UNABLE_TO_FIND_DOC). If `fileNames` is non-empty and ALL
+           lookups fail, the request returns HTTP 422 immediately without attempting upload.
+
+        2. **Azure container check**: Verifies the configured Azure container exists.
+           If not found, HTTP 500.
+
+        3. **UOSR generation**: A Unique Online Submission Reference is generated as
+           `"{singleBusinessIdentifier}_{epochSeconds}"`. This value forms the folder name in
+           Azure and the response `id`.
+
+        4. **File uploads**: User files are uploaded; then a PDF summary page is generated
+           (from `LandChangePdfGenerator`) and uploaded; then a control file is uploaded.
+           If any individual upload fails, the error is added to the response but other
+           files continue uploading.
+
+        5. **Cleanup**: Temp documents are deleted from TEMP_DOCUMENT after all uploads.
+
+        **HTTP 200**: All files uploaded. `id` = UOSR (e.g. `811111111_1700000000`). <!-- sfd-id-check: allow - Unix timestamp -->
+        **HTTP 422**: One or more uploads failed (code 30 = FAILED_TO_UPLOAD_ALL_FILES).
+                      `id` may still be present in the response if the UOSR was generated.
+        **HTTP 500**: Azure container not found or unexpected error.
+
+        **Source**: `AzureController.java`, `LandChangeAzureStorage.java`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LandChangePortalRequest'
+            examples:
+              landChange:
+                summary: Land change submission with two files
+                value:
+                  personId: 123456789 # sfd-id-check: allow - person ID
+                  organisationId: 987654321 # sfd-id-check: allow - organisation ID
+                  fileNames:
+                    - cover-letter.pdf
+                    - map-evidence.jpg
+                  singleBusinessIdentifier: 811111111
+                  firmReferenceNumber: 822222222
+                  customerReferenceNumber: 9333333333
+                  parcels:
+                    - parcelId: P123
+                      sheetId: SH12
+                      effectiveDate: '20/03/2023'
+                      coverChange:
+                        currentCoverTypeName: Permanent Grassland
+                        currentCoverTypeCode: PG01
+                        newCoverTypeName: Arable
+                        newCoverTypeCode: AR01
+                  changeType:
+                    code: LANDCOVER_CHANGE
+                    description: Land cover change submission
+      responses:
+        '200':
+          description: All files uploaded to Azure. `id` is the Unique Online Submission Reference.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                success:
+                  value:
+                    id: '811111111_1700000000' # sfd-id-check: allow - Unix timestamp
+        '422':
+          description: |
+            One or more files could not be uploaded (code 30 = FAILED_TO_UPLOAD_ALL_FILES),
+            or one or more fileNames not found in temporary storage (code 11 = UNABLE_TO_FIND_DOC).
+            The `id` may be present if the UOSR was generated before the failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                notFound:
+                  summary: File not found in temporary storage
+                  value:
+                    errors:
+                      - code: 11
+                        description: File not found
+                uploadFailed:
+                  summary: Upload failed
+                  value:
+                    id: '811111111_1700000000' # sfd-id-check: allow - Unix timestamp
+                    errors:
+                      - code: 30
+                        description: Failed to upload all files
+        '500':
+          description: Azure container not found or unexpected service error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+
+  /v1/internal/azure/upload:
+    post:
+      tags:
+        - internal
+      summary: Internal direct upload to a named Azure Blob container
+      operationId: internalAzureUpload
+      description: |
+        Internal-use endpoint for uploading a file directly to a named Azure Blob container,
+        with optional AV scanning. Not intended for direct portal consumer use.
+
+        **Behaviour**:
+        - The file is uploaded to `containerName` in Azure Blob Storage via `InternalAzureStorage`.
+        - If `requiresScan = true`, the file is sent to capd-file-validator-service for AV scan
+          before storage. A 400 response from the validator is treated as OK (the validator's
+          response body is returned instead). Other non-2xx responses from the validator cause
+          HTTP 500.
+        - HTTP 200 on success (no id returned — response is empty `{}`).
+        - HTTP 422 on upload or AV failure (errors array populated).
+        - HTTP 500 on unexpected error.
+
+        **Source**: `InternalAzureController.java`, `InternalAzureStorage.java`
+      parameters:
+        - name: containerName
+          in: query
+          required: true
+          description: Target Azure Blob container name. Must exist in the configured Azure storage account.
+          schema:
+            type: string
+        - name: requiresScan
+          in: query
+          required: false
+          description: Whether to run an AV scan via capd-file-validator-service before storage. Defaults to false.
+          schema:
+            type: boolean
+            default: false
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file to upload to Azure Blob Storage.
+      responses:
+        '200':
+          description: File uploaded to Azure successfully. Response body is an empty object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                success:
+                  value: {}
+        '422':
+          description: File upload failed or AV scan rejected the file.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                failure:
+                  value:
+                    errors:
+                      - code: 1
+                        description: AV scan failed
+        '500':
+          description: Unexpected service error (e.g. Azure storage unavailable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+
+components:
+  schemas:
+    DefaultResponse:
+      type: object
+      x-validation-source: DefaultResponse.java
+      description: Generic response. On success, `id` is set and errors is absent. On failure, errors is populated.
+      properties:
+        id:
+          type: string
+          description: |
+            Correlation identifier. For temporary upload: original filename. For Azure upload:
+            the Unique Online Submission Reference (UOSR) in format "{sbi}_{epochSeconds}".
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    ResponseError:
+      type: object
+      x-validation-source: ResponseError.java
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: |
+            Error code. Known values (from ResponseErrorCodes.java):
+            10 = UNABLE_TO_SAVE_DOC, 11 = UNABLE_TO_FIND_DOC, 12 = DUPLICATE_DOC_FOUND,
+            30 = FAILED_TO_UPLOAD_ALL_FILES, 40 = UNAUTHORIZED_USER_TYPE.
+        description:
+          type: string
+          description: Human-readable error description.
+
+    LandChangePortalRequest:
+      type: object
+      x-validation-source: LandChangePortalRequest.java, PortalRequest.java
+      description: |
+        Payload for the Azure upload endpoint. `fileNames` must reference files previously
+        uploaded via the temporary storage endpoint. No JSR-303 annotations are present.
+      properties:
+        personId:
+          type: integer
+          format: int64
+          description: Internal person identifier (Long).
+        organisationId:
+          type: integer
+          format: int64
+          description: Internal organisation identifier (Long).
+        fileNames:
+          type: array
+          description: |
+            List of filenames to upload. Each name is looked up in TEMP_DOCUMENT by
+            personId + organisationId + fileName. If a name is not found, error code 11
+            is returned. If empty or absent, no user files are uploaded (only PDF summary
+            and control file are generated).
+          items:
+            type: string
+        singleBusinessIdentifier:
+          type: integer
+          format: int64
+          description: Single Business Identifier (SBI). Used to generate the UOSR folder name in Azure.
+        firmReferenceNumber:
+          type: integer
+          format: int64
+          description: Firm Reference Number (FRN). Included in the control file.
+        customerReferenceNumber:
+          type: integer
+          format: int64
+          description: Customer Reference Number (CRN). Included in the control file.
+        parcels:
+          type: array
+          description: Parcels affected by the land change. Included in the generated PDF summary.
+          items:
+            $ref: '#/components/schemas/Parcel'
+        changeType:
+          $ref: '#/components/schemas/LandChangeType'
+
+    LandChangeType:
+      type: object
+      x-validation-source: LandChangeType.java
+      properties:
+        code:
+          type: string
+          description: Change type code (e.g. LANDCOVER_CHANGE, BOUNDARY_CHANGE).
+        description:
+          type: string
+          description: Human-readable change type description. Included in the generated PDF summary.
+
+    Parcel:
+      type: object
+      x-validation-source: Parcel.java
+      description: A land parcel affected by the change.
+      properties:
+        parcelId:
+          type: string
+          description: Parcel identifier.
+        sheetId:
+          type: string
+          description: OS sheet identifier for the parcel.
+        effectiveDate:
+          type: string
+          description: |
+            Date the land cover change takes effect. Format: dd/MM/yyyy (from
+            @JsonFormat(pattern = "dd/MM/yyyy") on Parcel.effectiveDate). NOT ISO 8601.
+          example: '20/03/2023'
+        coverChange:
+          $ref: '#/components/schemas/LandCoverChange'
+
+    LandCoverChange:
+      type: object
+      x-validation-source: LandCoverChange.java
+      description: Describes the before and after land cover type for a parcel.
+      properties:
+        currentCoverTypeName:
+          type: string
+          description: Name of the current (pre-change) land cover type.
+        currentCoverTypeCode:
+          type: string
+          description: Code of the current (pre-change) land cover type.
+        newCoverTypeName:
+          type: string
+          description: Name of the new (post-change) land cover type.
+        newCoverTypeCode:
+          type: string
+          description: Code of the new (post-change) land cover type.

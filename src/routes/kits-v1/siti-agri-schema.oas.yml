@@ -1,0 +1,646 @@
+openapi: 3.1.0
+info:
+  title: SitiAgri API
+  description: API for siti-agri data and related operations
+  version: '1.0.0'
+  license:
+    name: 'Open Government Licence v3.0'
+    url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3'
+security:
+  - mTLS: []
+servers:
+  - url: 'https://chs-upgrade-api.ruraldev.org.uk:8446/extapi'
+    description: 'The test server for KITS/V1 APIs'
+tags:
+  - name: 'siti-agri'
+    description: 'Operations related to siti-agri management'
+paths:
+  /SitiAgriApi/cv/agreementsByBusiness/sbi/{sbi}/list:
+    get:
+      tags:
+        - 'siti-agri'
+        - 'agreements'
+      summary: 'Find Agreements by SBI.'
+      description: 'Find Agreements by SBI'
+      operationId: 'findAgreementsBySBI'
+      parameters:
+        - name: 'sbi'
+          in: 'path'
+          description: 'SBI of the business to retrieve agreements for.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples:
+              - 1000000000 # sfd-id-check: allow - organisation ID
+              - 1111111111 # sfd-id-check: allow - organisation ID
+              - 2222222222 # sfd-id-check: allow - organisation ID
+              - 850000001
+              - 850000002
+              - 850000003
+              - 850000004
+              - 850000005
+      responses:
+        '200':
+          description: Returns Agreements details for the target organisation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgreementsResponse'
+        '403':
+          description: >
+            Getting Agreements data is forbidden, or a WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          description: 'Internal server error.'
+          $ref: '#/components/responses/InternalServerError'
+  /SitiAgriApi/cv/appByBusiness/sbi/{sbi}/list:
+    get:
+      tags:
+        - 'siti-agri'
+        - 'applications'
+      summary: 'List Applications for a business.'
+      description: 'Gets details for Applications for a business specified by SBI.'
+      operationId: 'getApplicationsBySBI'
+      parameters:
+        - name: 'sbi'
+          in: path
+          description: 'SBI of the business to retrieve applications for.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples:
+              - 1000000000 # sfd-id-check: allow - organisation ID
+              - 1111111111 # sfd-id-check: allow - organisation ID
+              - 2222222222 # sfd-id-check: allow - organisation ID
+              - 850000001
+              - 850000002
+              - 850000003
+              - 850000004
+              - 850000005
+      responses:
+        '200':
+          description: 'Returns full organisation details, with complete transition history.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationsResponse'
+        '403':
+          description: >
+            Getting Application details is forbidden, or a WAF rule has been triggered, or the SBI
+             was not found (i.e. 404!).
+          $ref: '#/components/responses/Forbidden'
+  /SitiAgriApi/cv/cphByBusiness/sbi/{sbi}/list:
+    get:
+      tags:
+        - 'siti-agri'
+        - 'cph'
+      summary: 'List CPHs for a business.'
+      description: 'Gets details for CPHs for a business specified by SBI.'
+      operationId: 'getCPHsBySBI'
+      parameters:
+        - name: 'sbi'
+          in: path
+          description: 'SBI of the business to retrieve CPHs for.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples:
+              - 1000000000 # sfd-id-check: allow - organisation ID
+              - 1111111111 # sfd-id-check: allow - organisation ID
+              - 2222222222 # sfd-id-check: allow - organisation ID
+              - 850000001
+              - 850000002
+              - 850000003
+              - 850000004
+              - 850000005
+        - name: pointInTime
+          in: query
+          description: >
+            An optional date/date-time/timestamp to filter the CPHs by.
+            If provided, only CPHs that were active at that point in time will be returned.
+            Otherwise, all CPHs will be returned.
+          required: false
+          schema:
+            type: string
+            pattern: '^(\d{4}-\d{2}-\d{2}[ +]\d{2}:\d{2}:\d{2}|)$'
+            examples:
+              - '2023-01-30+12:25:23'
+              - ''
+      responses:
+        '200':
+          description: Returns all CPH details, unless filtered by a specified `pointInTime`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CPHResponse'
+        '403':
+          description: >
+            Getting CPH details is forbidden, or a WAF rule has been triggered,
+            or the SBI was not found (i.e. 404!).
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: The `pointInTime` parameter was not conform to the expected pattern.
+          $ref: '#/components/responses/NotFound'
+  /SitiAgriApi/cv/landUseByBusinessParcel/sheet/{sheet}/parcel/{parcel}/sbi/{sbi}/list:
+    get:
+      tags:
+        - 'siti-agri'
+        - 'land use'
+      summary: 'List Land Use for a business.'
+      description: 'Gets details for Land Use for a business specified by SBI.'
+      operationId: 'getLandUseBySheetAndParcelAndSBI'
+      parameters:
+        - name: 'sheet'
+          in: path
+          description: 'Sheet of the business to retrieve land use for.'
+          required: true
+          schema:
+            type: string
+            examples:
+              - 'TE0001'
+              - 'TE0002'
+        - name: 'parcel'
+          in: path
+          description: 'Parcel of the business to retrieve land use for.'
+          required: true
+          schema:
+            type: string
+            examples:
+              - '1001'
+              - '1002'
+        - name: 'sbi'
+          in: path
+          description: 'SBI of the business to retrieve land use for a specific parcel on a specific sheet.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples:
+              - 1000000000 # sfd-id-check: allow - organisation ID
+              - 1111111111 # sfd-id-check: allow - organisation ID
+              - 2222222222 # sfd-id-check: allow - organisation ID
+              - 850000001
+              - 850000002
+              - 850000003
+              - 850000004
+              - 850000005
+        - name: pointInTime
+          in: query
+          description: >
+            An optional date/date-time/timestamp to filter the Land Use by.
+            If provided, only Land Use that were active at that point in time will be returned.
+            Otherwise, all Land Use will be returned.
+          required: false
+          schema:
+            type: string
+            # format: date-time
+            pattern: '^(\d{4}-\d{2}-\d{2}[ +]\d{2}:\d{2}:\d{2}|)$'
+            examples:
+              - '2023-01-30+12:25:23'
+              - ''
+      responses:
+        '200':
+          description: Returns all Land Use details for the specified sheet, parcel, and SBI.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LandUseByBusinessParcelResponse'
+        '403':
+          description: >
+            Getting Land Use details is forbidden, or a WAF rule has been triggered,
+            or the SBI was not found (i.e. 404!).
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: The `pointInTime` parameter did not conform to the expected pattern, or no data could be found for the specified date.
+          $ref: '#/components/responses/NotFound'
+
+components:
+  responses:
+    Forbidden:
+      description: Forbidden response
+      content:
+        text/html:
+          schema:
+            type: string
+          examples:
+            forbidden:
+              summary: Forbidden HTML response
+              value: |
+                <html><body><h1>403 Forbidden</h1>
+                Request forbidden by administrative rules.
+                </body></html>
+    NotFound:
+      description: Not Found response
+      content:
+        text/html:
+          schema:
+            type: string
+          examples:
+            notFound:
+              summary: Not Found HTML response
+              value: >
+                <!doctype html><html lang="en">
+                <head>
+                <title>HTTP Status 404 – Not Found</title>
+                </head>
+                <body>
+                <h1>HTTP Status 404 – Not Found</h1>
+                </body>
+                </html>
+        application/json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                example: 404
+              message:
+                type: string
+                example: 'HTTP 404 Not Found'
+    InternalServerError:
+      description: Internal server error.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                example: 500
+              message:
+                type: string
+                example: >
+                  There was an error processing your request. It has been logged (ID 704b9f3b19536a35).
+
+  schemas:
+    ResponseWrapper:
+      type: object
+      properties:
+        data:
+          type: array # items left abstract, to be overridden in specific responses
+        errorString:
+          type: [string, 'null']
+        success:
+          type: boolean
+      required:
+        - data
+        - errorString
+        - success
+      additionalProperties: false
+    AgreementsResponse:
+      allOf:
+        - $ref: '#/components/schemas/ResponseWrapper'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Agreement'
+    ApplicationsResponse:
+      allOf:
+        - $ref: '#/components/schemas/ResponseWrapper'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Application'
+    CPHResponse:
+      allOf:
+        - $ref: '#/components/schemas/ResponseWrapper'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/CPH'
+    LandUseByBusinessParcelResponse:
+      allOf:
+        - $ref: '#/components/schemas/ResponseWrapper'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/LandUseByBusinessParcel'
+    Agreement:
+      type: 'object'
+      properties:
+        sbi:
+          type: 'string'
+          description: 'SBI of the business'
+        contract_id:
+          type: 'string'
+          description: 'Contract ID'
+        agreement_name:
+          type: 'string'
+          description: 'Name of the agreement'
+        status:
+          type: 'string'
+          description: 'Status of the agreement'
+        contract_type:
+          type: 'string'
+          description: 'Type of contract'
+        scheme_year:
+          type: 'integer'
+          description: 'Scheme year'
+        start_date:
+          type: 'string'
+          description: 'Start date of the agreement'
+        end_date:
+          type: 'string'
+          description: 'End date of the agreement'
+        payment_schedules:
+          type: 'array'
+          description: 'List of payment schedules'
+          items:
+            $ref: '#/components/schemas/PaymentSchedule'
+      required:
+        - sbi
+        - contract_id
+        - agreement_name
+        - status
+        - contract_type
+        - scheme_year
+        - start_date
+        - end_date
+        - payment_schedules
+      additionalProperties: false
+    PaymentSchedule:
+      type: 'object'
+      properties:
+        option_code:
+          type: 'string'
+          description: 'Option code'
+        option_description:
+          type: 'string'
+          description: 'Description of the option'
+        commitment_group_start_date:
+          type: 'string'
+          description: 'Commitment group start date'
+        commitment_group_end_date:
+          type: 'string'
+          description: 'Commitment group end date'
+        year:
+          type: 'integer'
+          description: 'Year of the payment schedule'
+        sheet_name:
+          type: [string, 'null']
+          description: 'Sheet name'
+        parcel_name:
+          type: [string, 'null']
+          description: 'Parcel name'
+        action_area:
+          type: [integer, 'null']
+          description: 'Action area'
+        action_mtl:
+          type: [integer, 'null']
+          description: 'Action MTL'
+        action_units:
+          type: [number, 'null']
+          description: 'Action units'
+        parcel_total_area:
+          type: [integer, 'null']
+          description: 'Total area of the parcel'
+        payment_schedule_start_date:
+          type: 'string'
+          description: 'Payment schedule start date'
+        payment_schedule_end_date:
+          type: 'string'
+          description: 'Payment schedule end date'
+      required:
+        - option_code
+        - option_description
+        - commitment_group_start_date
+        - commitment_group_end_date
+        - year
+        - sheet_name
+        - parcel_name
+        - action_area
+        - action_mtl
+        - action_units
+        - parcel_total_area
+        - payment_schedule_start_date
+        - payment_schedule_end_date
+      additionalProperties: false
+    Application:
+      type: object
+      properties:
+        sbi:
+          type: string
+        subject_id:
+          type: integer
+        year:
+          type: integer
+        application_name:
+          type: [string, 'null']
+        module_code:
+          type: [string, 'null']
+        scheme:
+          type: [string, 'null']
+        application_id:
+          type: integer
+        status_code_p:
+          type: [string, 'null']
+        status_code_s:
+          type: [string, 'null']
+        status:
+          type: [string, 'null']
+        submission_date:
+          oneOf:
+            - type: string
+              pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}(?:Z|\+\d{2}:?\d{2})$'
+              example: '2019-01-30T12:25:23:023+0000'
+            - type: 'null'
+        portal_status_p:
+          type: [string, 'null']
+        portal_status_s:
+          type: [string, 'null']
+        portal_status:
+          type: [string, 'null']
+        fg_active:
+          type: [string, 'null']
+        transition_id:
+          type: integer
+        transition_name:
+          type: string
+        agreement_ref:
+          type: [string, 'null']
+        application_history:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApplicationHistory'
+      required:
+        - sbi
+        - subject_id
+        - year
+        - application_name
+        - module_code
+        - scheme
+        - application_id
+        - status_code_p
+        - status_code_s
+        - status
+        - submission_date
+        - portal_status_p
+        - portal_status_s
+        - portal_status
+        - fg_active
+        - transition_id
+        - transition_name
+        - agreement_ref
+        - application_history
+      additionalProperties: false
+    ApplicationHistory:
+      type: object
+      properties:
+        dt_transition:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}(?:Z|\+\d{2}:?\d{2})$'
+          example: '2019-01-30T12:25:23:023+0000'
+        check_status:
+          type: string
+        transition_id:
+          type: integer
+        transition_name:
+          type: string
+      required:
+        - dt_transition
+        - check_status
+        - transition_id
+        - transition_name
+      additionalProperties: false
+    LandUseByBusinessParcel:
+      type: object
+      properties:
+        start_date:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}\+\d{4}$'
+          example: '2021-01-01T00:00:00:000+0000'
+        end_date:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}\+\d{4}$'
+          example: '9999-12-31T00:00:00:000+0000'
+        dt_insert:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}\+\d{4}$'
+          example: '2021-03-01T12:09:09:009+0000'
+        dt_delete:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}\+\d{4}$'
+          example: '2019-01-30T12:25:23:023+0000'
+        area:
+          type: number
+          example: 1000
+        lu_code:
+          type: string
+          example: 'WO25'
+        length:
+          type: [number, 'null']
+          example: 1000
+        landuse:
+          type: string
+          example: 'SCRUB - UNGRAZEABLE'
+        campaign:
+          type: integer
+          example: 2021
+        sbi:
+          type: string
+          example: '890000001'
+        sheet_name:
+          type: string
+          example: 'TE0001'
+        parcel_name:
+          type: string
+          example: '1001'
+      required:
+        - dt_delete
+        - end_date
+        - area
+        - lu_code
+        - length
+        - landuse
+        - campaign
+        - sbi
+        - dt_insert
+        - sheet_name
+        - parcel_name
+        - start_date
+      additionalProperties: false
+    CPH:
+      type: object
+      properties:
+        sbi:
+          type: string
+        dt_insert:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}\+\d{4}$'
+          example: '2019-01-30T12:25:23:023+0000'
+        dt_delete:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}\+\d{4}$'
+          example: '2019-01-30T12:25:23:023+0000'
+        cph_number:
+          type: string
+          pattern: '^\d{2}/\d{3}/\d{4}$'
+          example: '12/345/6789'
+        parish:
+          type: [string, 'null']
+        species:
+          type: string
+        start_date:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}\+\d{4}$'
+          example: '2019-01-30T12:25:23:023+0000'
+        end_date:
+          type: string
+          pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}:\d{3}\+\d{4}$'
+          example: '2019-01-30T12:25:23:023+0000'
+        address:
+          type: [string, 'null']
+          examples:
+            - 'Farm, Village, Town, County, Postcode'
+            - '123456, 654321 EXAMPLE FARM, TE1 2ST'
+            # 'x-cord, y-cord Farm-name, Postcode' - not the same as x/y of the CPH below!
+        x:
+          oneOf:
+            - type: integer
+              minimum: 0
+              maximum: 0
+            - type: integer
+              minimum: 5515
+              maximum: 655654
+        y:
+          oneOf:
+            - type: integer
+              minimum: 0
+              maximum: 0
+            - type: integer
+              minimum: 5335
+              maximum: 1220301
+      required:
+        - sbi
+        - dt_insert
+        - dt_delete
+        - cph_number
+        - parish
+        - start_date
+        - end_date
+        - species
+        - address
+        - x
+        - y
+      additionalProperties: false
+
+  securitySchemes:
+    mTLS:
+      type: mutualTLS
+      description: >
+        Mutual TLS authentication. Client must present a certificate issued by the server.

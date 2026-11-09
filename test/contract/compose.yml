@@ -1,0 +1,38 @@
+services:
+  contract-tests:
+    # NOTE: v4.7.7 is the latest version to avoid issues with checking for request
+    # payload bodies with the forbidden "__proto__" property name!!
+    image: schemathesis/schemathesis:4.7.7
+    entrypoint: sh
+    command:
+      - -c
+      - |
+        result=0
+        for schema in ${SCHEMAS:-person organisation authenticate siti-agri land bank reference-data permissions internal-user payments} ; do
+          echo "Running contract tests for schema: $${schema}"
+          auth_header="email: $${TEST_USER_EMAIL:-testuser01@defra.gov.uk}"
+          if [ "$${schema}" = "payments" ]; then auth_header='Authorization: bearer token'; fi
+          # NOTE: endpoint-specific check/warning exclusions are configured in schemathesis.toml
+          # NOTE: fixed seed so the same data is generated on every run (i.e. stable PR checks);
+          # override with CONTRACT_TEST_SEED to reproduce or explore other generated data
+          schemathesis --config-file /schemathesis.toml run -H "$${auth_header}" \
+            --seed ${CONTRACT_TEST_SEED:-1} \
+            --exclude-checks=unsupported_method,not_a_server_error \
+            --report-vcr-path /tmp/$${schema}.logs.yaml \
+            "http://dal-mock:3100/schemata/$${schema}.yml"
+          result=$((result | $?))
+        done
+        if [ $${result} -eq 0 ] ; then
+          echo -e "\n✅ All contract tests passed successfully."
+        else
+          echo -e "\n❌ One or more contract tests failed!"
+        fi
+        exit $$result
+    depends_on:
+      dal-mock:
+        condition: service_healthy
+    networks:
+      - default
+    volumes:
+      - ./test/contract/logs:/tmp
+      - ./test/contract/schemathesis.toml:/schemathesis.toml:ro

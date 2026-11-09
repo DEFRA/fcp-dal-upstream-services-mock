@@ -1,0 +1,191 @@
+openapi: '3.0.1'
+info:
+  title: CAPD Places Service
+  version: v1
+  x-source-repository: capd-places-service
+  x-schema-incomplete: true
+  description: |
+    Proxy service for OS Places API postcode-to-address lookups. Accepts a postcode,
+    calls the Ordnance Survey Places API, and returns a list of addresses.
+
+    **Upstream consumers**: Portal front-end (address lookup during registration and
+    land change flows).
+    **Downstream dependencies**: Ordnance Survey (OS) Places API.
+
+    **Authentication**: No authentication scheme declared in this service.
+
+    **Note**: Source code repository is not available in this workspace. Schemas are
+    based on the generated Swagger 2.0 spec; `x-schema-incomplete: true` is applied
+    throughout.
+
+    **Response envelope**: Responses are wrapped in a `CapdResponse._data` envelope
+    (Dropwizard/Jersey service pattern).
+
+    **Error handling**:
+    - HTTP 400: OS Places API returned an error for the given postcode (passes through
+      the OS Places API error response)
+    - HTTP 500: Error occurred when calling the OS Places API client
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: status
+    description: Application health check
+  - name: places
+    description: Postcode address lookup
+
+paths:
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application health check
+      operationId: getStatus
+      description: Returns plain text indicating service health.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /places/{postCode}:
+    get:
+      tags:
+        - places
+      summary: Get addresses for a postcode
+      operationId: places
+      description: |
+        Looks up addresses associated with a UK postcode via the OS Places API.
+        Returns the matching addresses and the normalised postcode.
+
+        **HTTP 200**: Addresses found and returned.
+        **HTTP 400**: OS Places API returned an error for the postcode (e.g. invalid
+          format or postcode not found). The OS Places API error is passed through.
+        **HTTP 500**: Unexpected error calling the OS Places API client.
+
+        **Note**: Postcode format is not server-side validated; the request is forwarded
+        to OS Places as-is. The `message` field in the response may contain OS Places
+        error details on failure.
+      parameters:
+        - name: postCode
+          in: path
+          required: true
+          description: |
+            UK postcode to look up. Passed directly to OS Places API. Standard UK postcode
+            format expected (e.g. SW1A 1AA). No server-side format validation.
+          schema:
+            type: string
+            example: SW1A 1AA
+      responses:
+        '200':
+          description: Addresses returned for the postcode
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseCapdPlaces'
+              examples:
+                found:
+                  value:
+                    _data:
+                      postCode: SW1A 1AA
+                      addresses:
+                        - uprn: '100023336956'
+                          address: '10 DOWNING STREET, LONDON, SW1A 2AA'
+                          buildingNumber: '10'
+                          street: DOWNING STREET
+                          city: LONDON
+                          postCode: SW1A 1AA
+        '400':
+          description: |
+            OS Places API returned an error for the postcode. The error response from
+            OS Places is passed through.
+          content:
+            application/json:
+              schema:
+                type: object
+                x-schema-incomplete: true
+                description: Error response passed through from OS Places API
+        '500':
+          description: Unexpected error calling OS Places API
+          content:
+            application/json:
+              schema:
+                type: object
+                x-schema-incomplete: true
+
+components:
+  schemas:
+    CapdResponseCapdPlaces:
+      type: object
+      description: CapdResponse envelope wrapping a CapdPlaces payload.
+      properties:
+        _data:
+          $ref: '#/components/schemas/CapdPlaces'
+
+    CapdPlaces:
+      type: object
+      x-schema-incomplete: true
+      x-validation-source: Not available (no source repository)
+      description: Postcode lookup result containing matching addresses.
+      properties:
+        postCode:
+          type: string
+          description: The postcode that was looked up (may be normalised from the input).
+          example: SW1A 1AA
+        addresses:
+          type: array
+          description: List of addresses matching the postcode.
+          items:
+            $ref: '#/components/schemas/Address'
+        message:
+          type: string
+          description: |
+            Optional message field. May contain error details from OS Places API on failure.
+
+    Address:
+      type: object
+      x-schema-incomplete: true
+      x-validation-source: Not available (no source repository)
+      description: |
+        A single address from the OS Places API. Field availability depends on the OS Places
+        API response — some fields may be absent for some addresses.
+      properties:
+        uprn:
+          type: string
+          description: Unique Property Reference Number
+          example: '100023336956'
+        organisationName:
+          type: string
+          description: Organisation name at this address (if applicable)
+        address:
+          type: string
+          description: Full formatted address string
+        buildingNumber:
+          type: string
+          description: Building number
+        buildingName:
+          type: string
+          description: Building name (if applicable)
+        flatNumber:
+          type: string
+          description: Flat or unit number (if applicable)
+        street:
+          type: string
+          description: Street name
+        city:
+          type: string
+          description: City or town
+        dependentLocality:
+          type: string
+          description: Dependent locality (e.g. district or neighbourhood)
+        doubleDependentLocality:
+          type: string
+          description: Double dependent locality (rare — sub-locality)
+        postCode:
+          type: string
+          description: Full postcode for this address
+          example: SW1A 1AA

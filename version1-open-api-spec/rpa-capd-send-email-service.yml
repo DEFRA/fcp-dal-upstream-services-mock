@@ -1,0 +1,183 @@
+openapi: '3.0.1'
+info:
+  title: CAPD Send Email Service
+  version: v1
+  x-source-repository: capd-send-email-service
+  description: |
+    Dropwizard/Jersey service providing a simple SMTP email dispatch wrapper.
+    Accepts a `SimpleMailMessage` JSON request body and sends it via a configured
+    SMTP server using Jakarta Mail (javax.mail).
+
+    **Purpose**: Centralises all outbound email sending for CAPD services. Used by
+    `capd-internal-user-auth-services` and other services for activation, password
+    reset, reactivation, and notification emails.
+
+    **Authentication**: No authentication scheme. Internal service only.
+
+    **Upstream consumers**: capd-internal-user-auth-services (via `SendEmailClient`),
+    notification-related flows.
+
+    **Email address validation**: `to`, `cc`, and `bcc` addresses are validated using
+    `jakarta.mail.internet.InternetAddress.validate()` (strict RFC 2822 format check).
+    `from` and `replyTo` fields are NOT validated.
+
+    **SMTP configuration**: Host and port are read from `sendEmailConfiguration.smtpHost`
+    and `sendEmailConfiguration.smtpPort`. TLS (`mail.smtp.starttls.enable=true`) is
+    always enabled.
+
+    **Error handling**:
+    - `AddressException` (invalid recipient address) → HTTP 422, body: "Incorrect email
+      addresses format"
+    - `MessagingException` (SMTP send failure) → HTTP 500, body: "Error trying to send email"
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: status
+    description: Application health check
+  - name: sendEmail
+    description: Email dispatch
+
+paths:
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application health check
+      operationId: getStatus
+      description: Returns plain text indicating service health.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /sendEmail:
+    post:
+      tags:
+        - sendEmail
+      summary: Send an email
+      operationId: sendEmail
+      description: |
+        Dispatches an email via SMTP using the provided `SimpleMailMessage` payload.
+
+        **Validation** (before send):
+        1. Iterates over `to`, `cc`, and `bcc` addresses — each is validated via
+           `jakarta.mail.internet.InternetAddress.validate()`. An invalid address in
+           any of these arrays triggers HTTP 422.
+        2. `from` and `replyTo` are NOT validated.
+
+        **MIME construction**: Builds a `MimeMessage` from the `SimpleMailMessage` via
+        `MimeMessageBuilder.buildMessage(email, session)`.
+
+        **On success**: HTTP 200, body: "Email sent"
+        **On invalid address**: HTTP 422, body: "Incorrect email addresses format"
+        **On SMTP failure**: HTTP 500, body: "Error trying to send email"
+
+        **Note**: `to`, `cc`, `bcc` are JSON arrays of strings in request — the DTO uses
+        `String[]` arrays (not `List<String>`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SimpleMailMessage'
+            example:
+              from: 'no-reply@rural-payments.service.gov.uk'
+              to:
+                - 'farmer@example.com'
+              subject: 'Your Rural Payments account activation'
+              text: 'Please click the link to activate your account.'
+      responses:
+        '200':
+          description: Email sent successfully
+          content:
+            application/json:
+              schema:
+                type: string
+              example: 'Email sent'
+        '422':
+          description: |
+            One or more recipient addresses failed RFC 2822 validation
+            (`jakarta.mail.internet.AddressException`). Body: "Incorrect email
+            addresses format". Only `to`, `cc`, `bcc` are validated — not `from`
+            or `replyTo`.
+          content:
+            application/json:
+              schema:
+                type: string
+              example: 'Incorrect email addresses format'
+        '500':
+          description: |
+            SMTP send failure (`jakarta.mail.MessagingException`). Body: "Error
+            trying to send email".
+          content:
+            application/json:
+              schema:
+                type: string
+              example: 'Error trying to send email'
+
+components:
+  schemas:
+    SimpleMailMessage:
+      type: object
+      x-validation-source: SimpleMailMessage.java
+      description: |
+        Email message DTO. `to`, `cc`, `bcc` are serialised as JSON arrays of strings.
+        The DTO uses `String[]` arrays (not `List<String>`). All fields are nullable;
+        no `@NotNull` annotations are present in source — validation is done at send time.
+
+        **Edge cases**:
+        - If ALL of `to`, `cc`, `bcc` are null or empty arrays → no recipients → SMTP
+          rejects with `MessagingException` → HTTP 500 "Error trying to send email".
+          There is no explicit pre-send check for empty recipients.
+        - `subject` and `text` can be null → SMTP accepts but produces an email with
+          empty subject/body.
+        - `sentDate` maps to `java.util.Date` via Jackson deserialization. Invalid date
+          format may cause HTTP 400 from the deserialization layer (undocumented).
+      properties:
+        from:
+          type: string
+          description: |
+            Sender email address. Not validated by this service.
+          example: 'no-reply@rural-payments.service.gov.uk'
+        replyTo:
+          type: string
+          description: |
+            Reply-to email address. Not validated by this service.
+        to:
+          type: array
+          description: |
+            Recipient email addresses. Each address is validated via
+            `InternetAddress.validate()` → HTTP 422 if any are invalid.
+          items:
+            type: string
+            format: email
+        cc:
+          type: array
+          description: |
+            CC email addresses. Each address validated → HTTP 422 if any are invalid.
+          items:
+            type: string
+            format: email
+        bcc:
+          type: array
+          description: |
+            BCC email addresses. Each address validated → HTTP 422 if any are invalid.
+          items:
+            type: string
+            format: email
+        sentDate:
+          type: string
+          format: date-time
+          description: Optional send date. Maps to `java.util.Date`.
+        subject:
+          type: string
+          description: Email subject line
+        text:
+          type: string
+          description: Email body text (plain text or HTML depending on MIME construction)

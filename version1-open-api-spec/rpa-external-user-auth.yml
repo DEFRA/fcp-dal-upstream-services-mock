@@ -1,0 +1,1317 @@
+openapi: '3.0.1'
+info:
+  title: CAPD External User Authentication Service
+  version: v1
+  x-source-repository: capd-external-user-auth-services
+  description: |
+    Dropwizard 4.x / Hibernate / Jersey (JAX-RS) service managing external (citizen/farmer)
+    user accounts for the Rural Payments portal. Handles user registration, password lifecycle,
+    session management, security questions, and email validation.
+
+    **Database schema**: `CAPD_EXT_AUTH` (Oracle)
+    - `EXTERNAL_USER` — external user accounts (primary key: `customer_reference`)
+    - `REGISTRATION_CODE` — one-time registration codes
+    - `USER_CODE` — password reset / change codes
+    - `EXTERNAL_USER_SESSION` — session records
+    - `EMAIL_VALIDATION` — email address verification records
+    - `SECURITY_ANSWERS` — memorable question answers
+
+    **Audit**: Tables are audited with Hibernate Envers (`@Audited`): `EXTERNAL_USER_AUD`,
+    `USER_CODE_AUD`, `REGISTRATION_CODE_AUD`, `SECURITY_ANSWERS_AUD`, etc.
+
+    **Authentication/Authorisation**:
+    - `CallerFilter` extracts `callerId` from header and stores in request-scoped `CallerService`.
+    - `@CapdInternalEndpoint(functions = "deactivatePerson")` — applied to the GDPR obfuscation
+      endpoint.
+    - `@CapdPersonAuthorisation(functions = "viewPersonalInformation")` — applied to
+      `GET /security-answers/{customerReference}`.
+    - No JWT/OAuth validation in this service — relies on upstream API gateway authentication.
+
+    **Password security**: bcrypt hashing via `PasswordService.hashPassword()`. Stored as 60-char
+    bcrypt hash in `EXTERNAL_USER.password`.
+
+    **Password complexity rules** (enforced by `PasswordComplexityUtil`):
+    - Minimum **8 characters**
+    - Must contain **both uppercase AND lowercase** letters
+    - Must contain **at least one digit OR one special character**
+    - Special characters = Java `\p{Punct}` (all Unicode punctuation — includes `!@#$%^&*` and
+      extended Unicode punctuation like `£¥§`)
+    - Password must NOT equal the user's email address or CRN
+    - Password must NOT match any of the N most recent passwords (`previousPasswordsToCheck` config)
+    - Examples: `MyPassword1` ✓, `MyPassword!` ✓, `password1` ✗ (no uppercase), `PASSWORD!` ✗ (no lowercase)
+
+    **Account lockout**: When `failedLoginAttempts > maxLoginAttempts`, the account is
+    **permanently locked**. There is **no unlock endpoint or automatic reset mechanism**.
+    Locked accounts require manual database intervention. Note: the comparison uses `>`
+    (not `>=`), so the account locks after `maxLoginAttempts + 1` failed attempts.
+
+    **Password expiry**: When `lastPasswordChange` is older than `passwordValidityDays`,
+    HTTP 403 `PASSWORD_EXPIRED` is returned. **Edge case**: if `lastPasswordChange` is NULL
+    in the database, the password is treated as **immediately expired**.
+
+    **Registration attempt counter**: `registrationAttempts` increments on each invalid
+    registration code attempt but **never resets**. Once the maximum is exceeded, the
+    registration code becomes permanently unusable.
+
+    **Configurable parameters** (from `ExternalUserAuthServiceConfiguration`):
+    - `maxLoginAttempts` — failed login threshold before lockout
+    - `passwordValidityDays` — days before password expires
+    - `maxCodeVerificationAttempts` — max code verification attempts (default: 3)
+    - `registrationCodeLength` — registration code digit count (default: 6)
+    - `previousPasswordsToCheck` — number of previous passwords checked for reuse
+
+    **Email handling**: Email comparisons are **case-insensitive** (`equalsIgnoreCase`).
+
+    **CRN handling**: CRN values are **trimmed** (`StringUtils.trim()`) before processing.
+
+    **Undocumented endpoints in source** (not in original spec):
+    - `POST /change-password/b2c/code` (B2C password reset code)
+    - `POST /change-password/b2c` (B2C password change)
+    - `DELETE /users/obfuscate/{customerReference}/{obfuscationId}` (GDPR obfuscation)
+    - `GET /security-answers/{customerReference}`, `POST /security-answers/{customerReference}`,
+      `DELETE /security-answers/{customerReference}` (security questions)
+    - `POST /email-validation`, `POST /email-validation/validate-email` (email validation)
+
+    **Status code corrections vs original spec**:
+    - `POST /change-password` returns **204** not 200 on success
+    - `POST /users` returns **204** not 200 on success
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: change-password
+    description: Password reset and change flows (standard and B2C)
+  - name: registration-codes
+    description: User registration code lifecycle
+  - name: users
+    description: External user account management and authentication
+  - name: user-session
+    description: External user session persistence
+  - name: email-validation
+    description: Email address verification
+  - name: security-answers
+    description: Memorable security question answers
+  - name: status
+    description: Application health and status
+
+paths:
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application status check
+      operationId: getStatus
+      description: Returns plain text service status.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /healthcheck:
+    get:
+      tags:
+        - status
+      summary: Healthcheck (dependent services)
+      operationId: healthcheck
+      description: Checks status of dependent services.
+      responses:
+        '200':
+          description: All dependencies healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /change-password/code:
+    post:
+      tags:
+        - change-password
+      summary: Create a password reset code (standard flow)
+      operationId: createCode
+      description: |
+        Creates a password reset code (`USER_CODE`) for the external user and sends
+        a password reset email.
+
+        **Validation** (all → HTTP 401 unless noted):
+        1. `enteredCustomerEmail` ≠ `validCustomerEmail` → HTTP 401 "InvalidEmailOrCrn"
+        2. `CapdServicesClientService.findPerson(customerReference)` fails (person not found)
+           → HTTP 401
+        3. User not registered in `EXTERNAL_USER` (except B2C case) → HTTP 401
+        4. More than 3 `USER_CODE` records for this CRN in the last 60 minutes → HTTP 403
+           "ThreeCodesExist"
+        5. Email send failure (`MailSenderClientException`) → HTTP 500
+
+        **On success**: Deletes any existing `REGISTRATION_CODE` for the CRN,
+        saves a new `USER_CODE` (6-digit numeric code), updates `User.lastLogin`,
+        sends password reset email, returns HTTP 200.
+
+        **Bean validation**: All `@NotEmpty` / `@Email` / `@Length` annotations are applied
+        by Jersey's `@Valid` annotation processing.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCodeRequest'
+      responses:
+        '200':
+          description: Password reset code created and email sent
+        '401':
+          description: |
+            Email does not match CRN, person not found, or user not registered.
+            Body is `CreateCodeErrorResponse` with `error=InvalidEmailOrCrn`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateCodeErrorResponse'
+        '403':
+          description: |
+            3 or more codes already sent in last 60 minutes.
+            Body is `CreateCodeErrorResponse` with `error=ThreeCodesExist`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateCodeErrorResponse'
+        '500':
+          description: Email send failure (MailSenderClientException)
+
+  /change-password/b2c/code:
+    post:
+      tags:
+        - change-password
+      summary: Create a password reset code (B2C flow)
+      operationId: createB2cCode
+      description: |
+        B2C variant of the password reset code creation flow. Creates a `USER_CODE`
+        and sends an email. May also create a `User` record if the B2C match is successful
+        and the user does not yet exist in `EXTERNAL_USER`.
+
+        **Note**: This endpoint is NOT in the original OpenAPI spec — it was discovered
+        in the source code (`ChangePasswordResource`).
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateB2cCodeRequest'
+      responses:
+        '200':
+          description: B2C password reset code created and email sent
+        '401':
+          description: Invalid CRN or email
+        '500':
+          description: Error (email send failure or other)
+
+  /change-password:
+    post:
+      tags:
+        - change-password
+      summary: Change external user password
+      operationId: changePassword
+      description: |
+        Changes the external user's password after verifying a `USER_CODE` reset code.
+
+        **Validation order**:
+        1. `@Valid` bean validation — `@NotEmpty`, `@Length(10,10)`, `@Email`
+        2. `SecurityCodeService.validateSecurityCode()` — checks `USER_CODE` by CRN:
+           - Code not found / CRN not found → HTTP 410 (GONE)
+           - Email mismatch → HTTP 401
+           - Code expired → HTTP 401
+           - Max verification attempts exceeded → HTTP 403
+           - Code value mismatch → HTTP 401
+        3. `UserDAO.findExternalUser(customerReference)` — not found → HTTP 404
+        4. `PasswordValidationService.checkPasswordComplexity()` — not complex → HTTP 422
+        5. `PasswordValidationService.checkPasswordDoesNotMatchPreviousPasswords()` — re-used
+           → HTTP 422
+
+        **On success**: bcrypt-hashes the new password, updates `EXTERNAL_USER.password`,
+        sets `lastPasswordChange=now`, deletes all `USER_CODE` records for the CRN,
+        returns **HTTP 204** (No Content).
+
+        **NOTE**: Original spec says HTTP 200 on success — **actual source returns HTTP 204**.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          description: 'Password changed successfully (No Content). NOTE: original spec incorrectly states 200.'
+        '401':
+          description: Code invalid, expired, or email mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangePasswordErrorResponse'
+        '403':
+          description: Max verification attempts exceeded
+        '404':
+          description: User account not found in EXTERNAL_USER
+        '410':
+          description: Password reset code not found (GONE)
+        '422':
+          description: Password does not meet complexity or was previously used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangePasswordErrorResponse'
+
+  /change-password/b2c:
+    post:
+      tags:
+        - change-password
+      summary: Change external user password (B2C flow)
+      operationId: changeB2cPassword
+      description: |
+        B2C variant of the password change flow. Same validation logic as `POST /change-password`
+        but uses `ChangeB2cPasswordRequest` (no `@Length` / `@Email` constraints).
+
+        **Note**: This endpoint is NOT in the original OpenAPI spec.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeB2cPasswordRequest'
+      responses:
+        '204':
+          description: B2C password changed successfully
+        '401':
+          description: Code invalid or email mismatch
+        '403':
+          description: Max verification attempts exceeded
+        '404':
+          description: User account not found
+        '410':
+          description: Password reset code not found
+        '422':
+          description: Password does not meet complexity or was previously used
+
+  /change-password/{changePasswordCode}:
+    post:
+      tags:
+        - change-password
+      summary: Verify a password reset security code
+      operationId: verifySecurityCode
+      description: |
+        Validates a password reset code (`changePasswordCode`) for the user identified
+        by `customerReference` and `customerEmail` in the request body.
+
+        **Validation order**:
+        1. `SecurityCodeService.validateSecurityCode()` checks `USER_CODE`:
+           - Code not found → HTTP 410 (GONE)
+           - Email mismatch → HTTP 401
+           - Code expired → HTTP 401 with `ChangePasswordErrorResponse`
+           - Max verification attempts exceeded → HTTP 401
+        2. Returns HTTP 200 on success (code is valid)
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: changePasswordCode
+          in: path
+          required: true
+          description: The 6-digit password reset code to verify
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordCodeRequest'
+      responses:
+        '200':
+          description: Code is valid
+        '401':
+          description: Code expired, email mismatch, or attempts exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangePasswordErrorResponse'
+        '410':
+          description: Code not found (GONE) — no USER_CODE for this CRN/code
+
+  /registration-codes:
+    post:
+      tags:
+        - registration-codes
+      summary: Create a registration code
+      operationId: createRegistrationCode
+      description: |
+        Creates a 6-digit numeric registration code (via `SecureRandom`) for the given
+        CRN and sends a registration email.
+
+        **Validation**:
+        1. `@Valid` bean validation — `@NotEmpty`, `@Length(10,10)`, `@Email`
+        2. `UserDAO.findExternalUser(customerReference)` finds an existing account → HTTP 403
+           (identity already exists for this CRN)
+        3. Email send failure → HTTP 500
+
+        **On success**: Deletes any existing `REGISTRATION_CODE` for the CRN, creates a new
+        `REGISTRATION_CODE` with `code`, `email`, `created=now`, `registrationAttempts=0`,
+        returns HTTP 200 with the code value as a String.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRegistrationCodeRequest'
+      responses:
+        '200':
+          description: Registration code created and email sent. Body is the code value.
+          content:
+            application/json:
+              schema:
+                type: string
+        '403':
+          description: External user account already exists for this CRN
+        '500':
+          description: Email send failure
+
+    delete:
+      tags:
+        - registration-codes
+      summary: Delete a registration code by CRN
+      operationId: deleteRegistrationCode
+      description: |
+        Deletes `REGISTRATION_CODE` record(s) for the given `customerReference` query parameter.
+
+        **HTTP 400**: `customerReference` query param is missing.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: customerReference
+          in: query
+          required: false
+          description: CRN whose registration code should be deleted. Required — 400 if absent.
+          schema:
+            type: string
+            maxLength: 10
+      responses:
+        '200':
+          description: Registration code(s) deleted
+        '400':
+          description: customerReference query parameter is missing
+
+  /registration-codes/exists:
+    get:
+      tags:
+        - registration-codes
+      summary: Check if a registration code exists for a CRN
+      operationId: registrationCodeExists
+      description: |
+        Returns `true` if a `REGISTRATION_CODE` record exists for `customerReference`,
+        `false` otherwise.
+
+        **HTTP 400**: `customerReference` query param is missing.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: customerReference
+          in: query
+          required: false
+          description: CRN to check. Required — 400 if absent.
+          schema:
+            type: string
+            maxLength: 10
+      responses:
+        '200':
+          description: Boolean result
+          content:
+            application/json:
+              schema:
+                type: boolean
+        '400':
+          description: customerReference query parameter is missing
+
+  /registration-codes/{registrationCode}/{customerReference}:
+    get:
+      tags:
+        - registration-codes
+      summary: Validate a registration code
+      operationId: validateRegistrationCode
+      description: |
+        Validates that `registrationCode` is correct and not expired/exceeded for the
+        given `customerReference`.
+
+        **Path constraints**:
+        - `customerReference` must match regex `[0-9A-Za-z]{10}` (enforced by JAX-RS path regex)
+
+        **Validation logic** (via `RegistrationCodeService`):
+        1. No `REGISTRATION_CODE` found for CRN → HTTP 404
+        2. Code does not match → increment `registrationAttempts`, return HTTP 404
+        3. Max attempts exceeded (`registrationAttempts >= maxAttempts`) → HTTP 403
+        4. Code expired (based on creation timestamp + TTL config) → HTTP 403
+        5. Valid → HTTP 204 (No Content)
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: registrationCode
+          in: path
+          required: true
+          description: The 6-digit registration code to validate
+          schema:
+            type: string
+        - name: customerReference
+          in: path
+          required: true
+          description: CRN. Path regex enforces `[0-9A-Za-z]{10}`.
+          schema:
+            type: string
+            pattern: '^[0-9A-Za-z]{10}$'
+            minLength: 10
+            maxLength: 10
+      responses:
+        '204':
+          description: Code is valid (No Content)
+        '403':
+          description: Code expired or max registration attempts exceeded
+        '404':
+          description: Registration code not found or code mismatch for this CRN
+
+  /users:
+    post:
+      tags:
+        - users
+      summary: Create an external user account
+      operationId: createUser
+      description: |
+        Creates an `EXTERNAL_USER` record after validating the registration code and
+        password complexity.
+
+        **Validation order**:
+        1. `@Valid` — `@NotEmpty`, `@Length(10,10)` on `customerReference`
+        2. `callerId` header missing → HTTP 400
+        3. `RegistrationCodeService.checkIfCodeIsValidForRegistration()`:
+           - Code not found → HTTP 404, body `CreateUserErrorResponse(type=REGISTRATION_CODE_NOT_FOUND)`
+           - Max attempts exceeded → HTTP 401 with `remainingRegistrationAttempts`
+           - Code expired → HTTP 401, `type=REGISTRATION_CODE_EXPIRED`
+           - Invalid → HTTP 404
+        4. `PasswordValidationService.checkPasswordComplexity()` → HTTP 422,
+           `type=INVALID_PASSWORD`
+        5. `PasswordValidationService.checkPasswordDifferentFrom(email, crn)` — password
+           must not equal email or CRN → HTTP 422
+
+        **On success**: Deletes the `REGISTRATION_CODE`, creates `EXTERNAL_USER` with
+        `customerReference`, bcrypt-hashed `password`, `failedLoginAttempts=0`,
+        `lastLogin=now`, `lastPasswordChange=now`, `verificationAttempts=0`. Returns
+        **HTTP 204** (No Content).
+
+        **NOTE**: Original spec says HTTP 200 on success — **actual source returns HTTP 204**.
+        Also sends a welcome/confirmation email on success.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '204':
+          description: 'User created successfully. NOTE: original spec incorrectly states 200.'
+        '400':
+          description: callerId header is missing
+        '401':
+          description: Registration code expired or max attempts exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateUserErrorResponse'
+        '404':
+          description: Registration code not found or mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateUserErrorResponse'
+        '422':
+          description: Password does not meet complexity requirements or is not unique from CRN/email
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateUserErrorResponse'
+        '500':
+          description: Email send failure or unexpected error
+
+  /users/{customerReference}/exists:
+    get:
+      tags:
+        - users
+      summary: Check if an external user exists by CRN
+      operationId: userExists
+      description: |
+        Returns `true` if a record exists in `EXTERNAL_USER` for `customerReference`,
+        `false` otherwise.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: customerReference
+          in: path
+          required: true
+          description: 10-character Customer Reference Number (CRN)
+          schema:
+            type: string
+            maxLength: 10
+      responses:
+        '200':
+          description: Boolean result
+          content:
+            application/json:
+              schema:
+                type: boolean
+
+  /users/{customerReference}:
+    delete:
+      tags:
+        - users
+      summary: Delete an external user account
+      operationId: deleteUser
+      description: |
+        Deletes the `EXTERNAL_USER` record for `customerReference`. Does NOT remove
+        associated `REGISTRATION_CODE` or `USER_CODE` records.
+
+        **HTTP 404**: User not found in `EXTERNAL_USER` (throws `WebApplicationException(NOT_FOUND)`).
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: customerReference
+          in: path
+          required: true
+          description: 10-character CRN of the user to delete
+          schema:
+            type: string
+            maxLength: 10
+      responses:
+        '200':
+          description: User deleted successfully
+        '404':
+          description: User not found in EXTERNAL_USER
+
+  /users/obfuscate/{customerReference}/{obfuscationId}:
+    delete:
+      tags:
+        - users
+      summary: GDPR obfuscation of a user and associated records
+      operationId: obfuscateUser
+      description: |
+        GDPR right-to-erasure implementation. Obfuscates PII (email addresses) in both
+        live and audit tables for the given CRN, replacing email values with `obfuscationId`.
+
+        **Authorisation**: `@CapdInternalEndpoint(functions = "deactivatePerson")` — requires
+        internal endpoint access privilege. Failure → HTTP 403.
+
+        **Operations performed**:
+        1. `UserService.deleteUser(customerReference)` — deletes from `EXTERNAL_USER`
+        2. `RegistrationCodeService.obfuscateByCustomerReference()` — replaces email in
+           `REGISTRATION_CODE_AUD` with `obfuscationId`
+        3. `UserCodeService.obfuscateByCustomerReference()` — replaces email in
+           `USER_CODE_AUD` with `obfuscationId`
+
+        **Note**: This endpoint is NOT in the original OpenAPI spec.
+
+        **Returns**: HTTP 200 with JSON string describing what was deleted/obfuscated.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: customerReference
+          in: path
+          required: true
+          description: CRN of the user to obfuscate
+          schema:
+            type: string
+            maxLength: 10
+        - name: obfuscationId
+          in: path
+          required: true
+          description: Replacement value for PII (email addresses) in audit tables
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User obfuscated and deleted. Body describes what was removed.
+          content:
+            application/json:
+              schema:
+                type: string
+        '403':
+          description: Missing deactivatePerson internal endpoint privilege
+
+  /users/{customerReference}/authentication-attempt:
+    post:
+      tags:
+        - users
+      summary: Authenticate an external user
+      operationId: authenticationAttempt
+      description: |
+        Validates external user credentials (CRN + password). Returns account status.
+
+        **Authentication logic**:
+        1. `UserDAO.getByCustomerReference(customerReference)` — user not found → HTTP 401,
+           `userStatus=INVALID_CREDENTIALS`
+        2. `UserService.isLocked()` — `failedLoginAttempts >= maxLoginAttempts` → HTTP 403,
+           `userStatus=ACCOUNT_LOCKED`
+        3. `PasswordService.passwordMatch(password, user.password)` — bcrypt comparison:
+           - Mismatch: increment `EXTERNAL_USER.failedLoginAttempts`, update `lastFailedLogin`;
+             if now locked → HTTP 403 `ACCOUNT_LOCKED`; else HTTP 401
+             `INVALID_CREDENTIALS`
+           - Match: reset `failedLoginAttempts=0`, update `lastLogin=now`;
+             BUT if account was **already locked** (exceeded max before this attempt) →
+             HTTP 403 `ACCOUNT_LOCKED_ALREADY` (correct password but account is locked)
+        4. `user.hasPasswordExpired()` — `lastPasswordChange < (now - passwordValidityDays)`
+           → HTTP 403 `PASSWORD_EXPIRED`
+        5. All checks pass → HTTP 200 `userStatus=OK`
+
+        **Config**: `maxLoginAttempts`, `passwordValidityDays` from service configuration.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: customerReference
+          in: path
+          required: true
+          description: 10-character CRN of the user to authenticate
+          schema:
+            type: string
+            maxLength: 10
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthenticationAttemptRequest'
+      responses:
+        '200':
+          description: Authentication successful. `userStatus=OK`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationAttemptResponse'
+        '401':
+          description: User not found or password incorrect. `userStatus=INVALID_CREDENTIALS`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationAttemptResponse'
+        '403':
+          description: |
+            Account already locked (`ACCOUNT_LOCKED`), just became locked (`ACCOUNT_LOCKED_ALREADY`),
+            or password expired (`PASSWORD_EXPIRED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationAttemptResponse'
+
+  /user-session:
+    get:
+      tags:
+        - user-session
+      summary: Check if an external user session exists
+      operationId: getExternalUserSession
+      description: |
+        Looks up `EXTERNAL_USER_SESSION` by `callerId` header. Returns session info or
+        `NO_SESSION` status.
+
+        **HTTP 400**: `callerId` header is missing.
+      parameters:
+        - name: callerId
+          in: header
+          required: true
+          description: Caller ID to look up. Required — 400 if missing.
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Session status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersistUserSessionResponse'
+        '400':
+          description: callerId header is missing
+
+    delete:
+      tags:
+        - user-session
+      summary: Delete an external user session
+      operationId: deleteExternalUserSession
+      description: |
+        Deletes `EXTERNAL_USER_SESSION` record for `callerId`.
+
+        **HTTP 400**: `callerId` header is missing.
+        **HTTP 404**: No session found for `callerId`.
+      parameters:
+        - name: callerId
+          in: header
+          required: true
+          description: Caller ID whose session should be deleted. Required — 400 if missing.
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Session deleted
+        '400':
+          description: callerId header is missing
+        '404':
+          description: No session found for this callerId
+
+  /user-session/persist-session:
+    post:
+      tags:
+        - user-session
+      summary: Persist an external user session
+      operationId: persistExternalUserSession
+      description: |
+        Creates a new `EXTERNAL_USER_SESSION` record. Uses `callerId` from the **request body**
+        as the primary key.
+
+        **HTTP 412** (Precondition Failed): A session already exists for `request.callerId`.
+        Delete the existing session first.
+
+        **`@Digits(integer=20, fraction=0)`** on `PersistUserSessionRequest.callerId`.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersistUserSessionRequest'
+      responses:
+        '200':
+          description: Session created. Returns `sessionStatus=EXISTING_SESSION`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersistUserSessionResponse'
+        '412':
+          description: Session already exists for this callerId
+
+  /email-validation:
+    post:
+      tags:
+        - email-validation
+      summary: Save email validation record
+      operationId: saveEmailValidation
+      description: |
+        Saves or replaces an email validation record in `EXTERNAL_USER.EMAIL_VALIDATION`.
+        Keyed by `customerReference`.
+
+        **Note**: This endpoint is NOT in the original OpenAPI spec.
+
+        **Logic**:
+        1. `EmailValidationDAO.getEmailValidationEntryForCrn(customerReference)`:
+           - If exists with SAME email: returns HTTP 409 (customer already has this email)
+           - If exists with DIFFERENT email: deletes old record, saves new record
+           - If not exists: saves new record
+        2. Returns HTTP 200 on success.
+
+        **HTTP 403**: Email already exists for a different CRN (cross-CRN uniqueness check).
+        **HTTP 500**: Unexpected persistence error.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailValidationRequest'
+      responses:
+        '200':
+          description: Email validation record saved
+        '403':
+          description: Email already associated with a different CRN
+        '409':
+          description: |
+            Customer already has this email saved.
+            **Warning**: Code analysis suggests this response may never be returned — the
+            code path for duplicate email returns HTTP 200 and silently replaces the record.
+        '500':
+          description: Internal error
+
+  /email-validation/validate-email:
+    post:
+      tags:
+        - email-validation
+      summary: Validate an email address link
+      operationId: validateEmail
+      description: |
+        Validates an email address link (e.g., from a registration email) by checking the
+        `EMAIL_VALIDATION` table against the provided details.
+
+        **Note**: This endpoint is NOT in the original OpenAPI spec.
+
+        **HTTP 401**: Email link has expired (based on `linkSentDate`).
+        **HTTP 404**: Email not found in `EMAIL_VALIDATION` for given CRN / partyDigitalContactId.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailValidationRequest'
+      responses:
+        '200':
+          description: Email validated successfully
+        '401':
+          description: Email link has expired
+        '404':
+          description: Email not found
+
+  /security-answers/{customerReference}:
+    get:
+      tags:
+        - security-answers
+      summary: Get security answers for a user
+      operationId: getSecurityAnswers
+      description: |
+        Retrieves the memorable security question answers for `customerReference`.
+
+        **Authorisation**: `@CapdPersonAuthorisation(functions = "viewPersonalInformation")`
+        — caller must have the `viewPersonalInformation` function for this person.
+        Failure → HTTP 400 (insufficient privileges).
+
+        **Audit**: Adds an entry to `SECURITY_VIEW_LOG` on each successful read.
+
+        **Note**: This endpoint is NOT in the original OpenAPI spec.
+
+        **CRN format**: Path regex `[0-9]{10}`.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: customerReference
+          in: path
+          required: true
+          description: 10-digit CRN. JAX-RS path regex enforces `[0-9]{10}`.
+          schema:
+            type: string
+            pattern: '^[0-9]{10}$'
+            minLength: 10
+            maxLength: 10
+      responses:
+        '200':
+          description: Security answers found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecurityAnswerResponse'
+        '204':
+          description: No security answers for this CRN
+        '400':
+          description: Insufficient privileges (viewPersonalInformation function missing)
+        '500':
+          description: Error retrieving answers
+
+    post:
+      tags:
+        - security-answers
+      summary: Save security answers for a user
+      operationId: saveSecurityAnswers
+      description: |
+        Saves the memorable security question answers for `customerReference`.
+
+        **Note**: This endpoint is NOT in the original OpenAPI spec.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: customerReference
+          in: path
+          required: true
+          description: 10-digit CRN. JAX-RS path regex enforces `[0-9]{10}`.
+          schema:
+            type: string
+            pattern: '^[0-9]{10}$'
+            minLength: 10
+            maxLength: 10
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SecurityAnswersRequest'
+      responses:
+        '200':
+          description: Security answers saved
+        '400':
+          description: Insufficient privileges
+        '500':
+          description: Error saving answers
+
+    delete:
+      tags:
+        - security-answers
+      summary: Delete security answers for a user
+      operationId: deleteSecurityAnswers
+      description: |
+        Deletes the `SECURITY_ANSWERS` record for `customerReference`.
+
+        **Note**: This endpoint is NOT in the original OpenAPI spec.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: customerReference
+          in: path
+          required: true
+          description: 10-digit CRN. JAX-RS path regex enforces `[0-9]{10}`.
+          schema:
+            type: string
+            pattern: '^[0-9]{10}$'
+            minLength: 10
+            maxLength: 10
+      responses:
+        '200':
+          description: Security answers deleted
+        '400':
+          description: Insufficient privileges
+
+components:
+  parameters:
+    callerId:
+      name: callerId
+      in: header
+      required: false
+      description: Internal CAPD caller identifier (BigInteger). Extracted by CallerFilter.
+      schema:
+        type: integer
+
+  schemas:
+    CreateCodeRequest:
+      type: object
+      x-validation-source: CreateCodeRequest.java (capd-external-user-auth-api)
+      required:
+        - customerReference
+        - enteredCustomerEmail
+        - firstName
+        - lastName
+      properties:
+        customerReference:
+          type: string
+          description: CRN. `@Length(10,10)` — exactly 10 characters. `@NotEmpty`.
+          minLength: 10
+          maxLength: 10
+        enteredCustomerEmail:
+          type: string
+          format: email
+          description: Email entered by user. `@NotEmpty @Email`. Validated against `validCustomerEmail`.
+        validCustomerEmail:
+          type: string
+          format: email
+          description: Email from trusted source (e.g., CAPD person record). `@Email`. May be null.
+        firstName:
+          type: string
+          description: User's first name. `@NotEmpty`.
+        lastName:
+          type: string
+          description: User's last name. `@NotEmpty`.
+
+    CreateB2cCodeRequest:
+      type: object
+      x-validation-source: CreateB2cCodeRequest.java (capd-external-user-auth-api)
+      description: B2C variant of password reset code request. Less strict validation.
+      properties:
+        customerReference:
+          type: string
+          maxLength: 10
+        emailAddress:
+          type: string
+          format: email
+        validCustomerEmail:
+          type: string
+          format: email
+          description: '`@Email` validated'
+        firstName:
+          type: string
+        lastName:
+          type: string
+        personId:
+          type: integer
+          description: CAPD person ID (BigInteger)
+
+    CreateCodeErrorResponse:
+      type: object
+      x-validation-source: CreateCodeErrorResponse.java
+      properties:
+        message:
+          type: string
+        error:
+          type: string
+          description: '`InvalidEmailOrCrn` | `ThreeCodesExist`'
+          enum:
+            - InvalidEmailOrCrn
+            - ThreeCodesExist
+
+    ChangePasswordRequest:
+      type: object
+      x-validation-source: ChangePasswordRequest.java (capd-external-user-auth-api)
+      required:
+        - customerReference
+        - customerEmail
+        - verificationCode
+        - newPassword
+      properties:
+        customerReference:
+          type: string
+          description: '`@Length(10,10) @NotEmpty`'
+          minLength: 10
+          maxLength: 10
+        customerEmail:
+          type: string
+          format: email
+          description: '`@Email @NotEmpty`'
+        verificationCode:
+          type: string
+          description: The 6-digit code from the reset email. `@NotEmpty`.
+        newPassword:
+          type: string
+          description: |
+            The new plaintext password. `@NotEmpty`. bcrypt-hashed before storage.
+            Must meet complexity rules: min 8 chars, mixed case, digit or special char
+            (Unicode `\p{Punct}`). Must not match email, CRN, or recent passwords.
+
+    ChangeB2cPasswordRequest:
+      type: object
+      x-validation-source: ChangeB2cPasswordRequest.java (capd-external-user-auth-api)
+      description: B2C variant of password change request. No Length/Email annotations.
+      properties:
+        customerReference:
+          type: string
+          maxLength: 10
+        emailAddress:
+          type: string
+        verificationCode:
+          type: string
+        password:
+          type: string
+
+    ChangePasswordCodeRequest:
+      type: object
+      x-validation-source: ChangePasswordCodeRequest.java (capd-external-user-auth-api)
+      required:
+        - customerReference
+        - customerEmail
+      properties:
+        customerReference:
+          type: string
+          description: '`@Length(10,10) @NotEmpty`'
+          minLength: 10
+          maxLength: 10
+        customerEmail:
+          type: string
+          format: email
+          description: '`@Email @NotEmpty`'
+
+    ChangePasswordErrorResponse:
+      type: object
+      x-validation-source: ChangePasswordErrorResponse.java
+      properties:
+        message:
+          type: string
+        error:
+          type: string
+          enum:
+            - InvalidEmailCrnOrCode
+            - CodeExpired
+            - PasswordNotComplexEnough
+            - UserAccountNotFound
+            - PasswordReused
+
+    CreateRegistrationCodeRequest:
+      type: object
+      x-validation-source: CreateRegistrationCodeRequest.java (capd-external-user-auth-api)
+      required:
+        - customerReference
+        - customerEmail
+        - firstName
+        - lastName
+      properties:
+        customerReference:
+          type: string
+          description: '`@Length(10,10) @NotEmpty`'
+          minLength: 10
+          maxLength: 10
+        customerEmail:
+          type: string
+          format: email
+          description: '`@Email @NotEmpty`'
+        firstName:
+          type: string
+          description: '`@NotEmpty`'
+        lastName:
+          type: string
+          description: '`@NotEmpty`'
+
+    CreateUserRequest:
+      type: object
+      x-validation-source: CreateUserRequest.java (capd-external-user-auth-api)
+      required:
+        - customerReference
+        - registrationCode
+        - password
+      properties:
+        customerReference:
+          type: string
+          description: '`@Length(10,10) @NotEmpty`'
+          minLength: 10
+          maxLength: 10
+        registrationCode:
+          type: string
+          description: 6-digit registration code from email. `@NotEmpty`.
+        password:
+          type: string
+          description: |
+            Plaintext password. `@NotEmpty`. bcrypt-hashed before storage.
+            Must meet complexity rules: min 8 chars, mixed case, digit or special
+            char (Unicode `\p{Punct}`). Must not equal email or CRN.
+
+    CreateUserErrorResponse:
+      type: object
+      x-validation-source: CreateUserErrorResponse.java
+      description: Error response for POST /users. Extends ErrorResponse.
+      properties:
+        message:
+          type: string
+        error:
+          type: string
+        type:
+          type: string
+          enum:
+            - INVALID_CUSTOMER_REFERENCE
+            - LIMIT_EXCEEDED
+            - REGISTRATION_CODE_NOT_FOUND
+            - REGISTRATION_CODE_EXPIRED
+            - INVALID_PASSWORD
+            - ERROR
+        remainingRegistrationAttempts:
+          type: integer
+          description: Remaining allowed registration attempts. Present when type=LIMIT_EXCEEDED.
+
+    AuthenticationAttemptRequest:
+      type: object
+      x-validation-source: AuthenticationAttemptRequest.java (capd-external-user-auth-api)
+      required:
+        - password
+      properties:
+        password:
+          type: string
+          description: Plaintext password for bcrypt comparison. `@NotEmpty`.
+
+    AuthenticationAttemptResponse:
+      type: object
+      x-validation-source: AuthenticationAttemptResponse.java (capd-external-user-auth-api)
+      description: |
+        Authentication result. Present in both 200 (OK) and 401/403 (failure) responses.
+      properties:
+        userStatus:
+          type: string
+          description: |
+            Account status at the time of the authentication attempt:
+            - `OK` — authenticated successfully
+            - `INVALID_CREDENTIALS` — user not found or wrong password
+            - `ACCOUNT_LOCKED` — account became locked due to this failed attempt (threshold just exceeded)
+            - `ACCOUNT_LOCKED_ALREADY` — account was already locked before this attempt (correct password provided but account is locked)
+            - `PASSWORD_EXPIRED` — password validity period exceeded (lastPasswordChange older than passwordValidityDays; also returned if lastPasswordChange is NULL)
+          enum:
+            - OK
+            - INVALID_CREDENTIALS
+            - ACCOUNT_LOCKED
+            - ACCOUNT_LOCKED_ALREADY
+            - PASSWORD_EXPIRED
+
+    PersistUserSessionRequest:
+      type: object
+      x-validation-source: PersistUserSessionRequest.java (shared API library)
+      description: Session creation request. `callerId` from body used as primary key.
+      required:
+        - callerId
+        - capdAccessToken
+      properties:
+        callerId:
+          type: integer
+          description: |
+            Session caller ID. `@Digits(integer=20, fraction=0)`. Used as
+            `EXTERNAL_USER_SESSION.caller_id` (NUMBER(20)) primary key.
+        capdAccessToken:
+          type: string
+          description: Session token (UUID). `@NotEmpty @Length(max=255)`. Max 255 chars.
+          maxLength: 255
+
+    PersistUserSessionResponse:
+      type: object
+      x-validation-source: PersistUserSessionResponse.java (shared API library)
+      properties:
+        sessionStatus:
+          type: string
+          enum:
+            - EXISTING_SESSION
+            - NO_SESSION
+          description: '`EXISTING_SESSION` — session found or just created. `NO_SESSION` — not found.'
+        callerId:
+          type: integer
+          description: Session callerId (NUMBER(20)). Null if NO_SESSION.
+        capdAccessToken:
+          type: string
+          description: Session token. Null if NO_SESSION.
+        logInTimestamp:
+          type: string
+          format: date-time
+          description: Session creation timestamp. Null if NO_SESSION.
+
+    EmailValidationRequest:
+      type: object
+      x-validation-source: EmailValidationRequest.java (capd-external-user-auth-api)
+      description: Email validation record (CAPD_EXT_AUTH.EMAIL_VALIDATION).
+      properties:
+        customerReference:
+          type: string
+          description: CRN primary key (VARCHAR2(10))
+          maxLength: 10
+        partyDigitalContactId:
+          type: integer
+          description: Party digital contact ID (BigInteger, NOT NULL)
+        email:
+          type: string
+          format: email
+          description: Email address to validate
+        linkSentDate:
+          type: string
+          format: date-time
+          description: Timestamp when the validation link was sent
+
+    SecurityAnswersRequest:
+      type: object
+      x-validation-source: SecurityAnswersRequest.java (capd-external-user-auth-api)
+      description: Security question answers for a user.
+      properties:
+        date:
+          type: string
+          description: Memorable date answer. Maps to SECURITY_ANSWERS.memorable_date.
+        event:
+          type: string
+          description: Memorable event answer. Maps to SECURITY_ANSWERS.memorable_event.
+        location:
+          type: string
+          description: Memorable location answer. Maps to SECURITY_ANSWERS.memorable_location.
+        email:
+          type: string
+          description: Email used as a security answer. Maps to SECURITY_ANSWERS.email.
+
+    SecurityAnswerResponse:
+      x-schema-incomplete: true
+      x-validation-source: SecurityAnswerResponse.java (capd-external-user-auth-api)
+      description: Security question answers returned from GET /security-answers/{customerReference}
+      type: object
+      properties:
+        customerReference:
+          type: string
+          maxLength: 10
+        memorableDate:
+          type: string
+        memorableEvent:
+          type: string
+        memorableLocation:
+          type: string
+        email:
+          type: string
+        lastUpdatedOn:
+          type: string
+          format: date-time

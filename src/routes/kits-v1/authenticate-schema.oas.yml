@@ -1,0 +1,223 @@
+openapi: 3.1.0
+info:
+  title: Authenticate data API
+  description: API for person authenticate data related operations
+  version: '1.0.0'
+  license:
+    name: 'Open Government Licence v3.0'
+    url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3'
+security:
+  - mTLS: []
+servers:
+  - url: 'https://chs-upgrade-api.ruraldev.org.uk:8446/extapi'
+    description: 'The test server for KITS/V1 APIs'
+tags:
+  - name: 'authenticate'
+    description: 'Operations related to person authenticate data management'
+paths:
+  /external-auth/security-answers/{crn}:
+    get:
+      tags:
+        - 'authenticate'
+      summary: 'Get security answers for a person'
+      description: 'Returns security answers for a person identified by the provided CRN.'
+      operationId: 'getSecurityAnswers'
+      parameters:
+        - name: 'crn'
+          in: 'path'
+          description: 'CRN of the person to retrieve security answers for.'
+          required: true
+          schema:
+            type: 'string'
+            pattern: '^[1-9][0-9]{9,19}$'
+            examples:
+              - '9111111100'
+              - '9111111200'
+              - '9111111300'
+              - '9111111400'
+              - '9111111500'
+      responses:
+        '200':
+          description: 'Security answers retrieved successfully.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticateData'
+        '204':
+          description: 'No security answers found for the provided CRN.'
+        '403':
+          description: >
+            Getting a person's Authenticate details is forbidden, or a WAF rule has been triggered.
+          content:
+            text/html:
+              schema:
+                type: string
+              examples:
+                forbidden:
+                  summary: Forbidden HTML response
+                  value: |
+                    <html><body><h1>403 Forbidden</h1>
+                    Request forbidden by administrative rules.
+                    </body></html>
+        '404':
+          description: 'Person not found'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 404
+                  message:
+                    type: string
+                    example: 'HTTP 404 Not Found'
+        '500':
+          description: 'Internal server error.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: >
+                      There was an error processing your request. It has been logged (ID 704b9f3b19536a35).'
+    post:
+      tags:
+        - 'authenticate'
+      summary: 'Save security answers for a person'
+      description: >
+        Saves (replacing any existing) memorable security question answers for a person
+        identified by the provided CRN.
+      operationId: 'saveSecurityAnswers'
+      parameters:
+        - name: 'crn'
+          in: 'path'
+          description: 'CRN of the person to save security answers for.'
+          required: true
+          schema:
+            type: 'string'
+            pattern: '^[1-9][0-9]{9,19}$'
+            examples:
+              - '9111111100'
+              - '9111111200'
+              - '9111111300'
+              - '9111111400'
+              - '9111111500'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SecurityAnswersRequest'
+      responses:
+        '200':
+          description: 'Security answers saved successfully.'
+        '403':
+          description: >
+            Saving a person's Authenticate details is forbidden, or a WAF rule has been triggered.
+          content:
+            text/html:
+              schema:
+                type: string
+              examples:
+                forbidden:
+                  summary: Forbidden HTML response
+                  value: |
+                    <html><body><h1>403 Forbidden</h1>
+                    Request forbidden by administrative rules.
+                    </body></html>
+        '404':
+          description: 'Person not found'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 404
+                  message:
+                    type: string
+                    example: 'HTTP 404 Not Found'
+        '500':
+          description: 'Internal server error, e.g. when a memorable answer is longer than 256 characters.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: >
+                      There was an error processing your request. It has been logged (ID 704b9f3b19536a35).'
+
+components:
+  schemas:
+    AuthenticateData:
+      type: 'object'
+      additionalProperties: false
+      properties:
+        customerReference:
+          type: 'string'
+          pattern: '^[1-9][0-9]{7,19}$'
+          description: 'Customer Reference Number (CRN) of the person.'
+        memorableDate:
+          type: [string, 'null']
+          description: 'Memorable date for the person.'
+        memorableEvent:
+          type: [string, 'null']
+          description: 'Memorable event for the person.'
+        memorableLocation:
+          type: [string, 'null']
+          description: 'Memorable location for the person.'
+        lastUpdatedOn:
+          type: [string, 'null']
+          format: 'date-time'
+          description: 'Timestamp of the last update to the authenticate data.'
+      required:
+        - 'customerReference'
+        - 'memorableDate'
+        - 'memorableEvent'
+        - 'memorableLocation'
+        - 'lastUpdatedOn'
+      example:
+        customerReference: '9111111100'
+        memorableDate: '2020-01-01'
+        memorableEvent: 'Graduation'
+        memorableLocation: 'London'
+        lastUpdatedOn: '2023-10-01T12:00:00Z'
+
+    SecurityAnswersRequest:
+      type: 'object'
+      properties:
+        date:
+          type: 'string'
+          description: 'Memorable date answer.'
+        event:
+          type: 'string'
+          description: 'Memorable event answer.'
+        location:
+          type: 'string'
+          description: 'Memorable location answer.'
+        email:
+          type: 'string'
+          description: 'Email used as a security answer.'
+      example:
+        date: '2020-01-01'
+        event: 'Graduation'
+        location: 'London'
+        email: 'person@example.com'
+
+  securitySchemes:
+    mTLS:
+      type: mutualTLS
+      description: >
+        Mutual TLS authentication. Client must present a certificate issued by the server.

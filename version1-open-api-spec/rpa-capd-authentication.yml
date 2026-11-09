@@ -1,0 +1,414 @@
+openapi: '3.0.1'
+info:
+  title: CAPD Authentication Service
+  version: v1
+  x-source-repository: capd-authentication
+  description: |
+    Dropwizard/Spring service managing user session lifecycle for the CAPD portal.
+    Sessions are stored in both **Memcached** (fast lookup / TTL-based expiry) and
+    a **database** (`EXTERNAL_USER_SESSION` table, for cross-instance tracking).
+
+    **Purpose**: Acts as the session authority for portal users (internal and external).
+    Validates, creates, terminates, and inspects sessions. Tightly coupled with
+    Nginx/reverse proxy which uses `GET /session/{uuid}` to authorise requests.
+
+    **Session format** (text/plain body on validate): `{callerId}|{userType}||{status}`
+    where `status` is `SESSION_ACTIVE` or `SESSION_TERMINATED`.
+
+    **Create session request body** (text/plain): `{callerId}|{userType}` (pipe-separated).
+    Must parse to exactly 2 segments; `callerId` must be a valid BigInteger.
+    Any other format triggers HTTP 400 (`WrongSessionDetailsData` exception).
+
+    **Session cookie**: `GET /session/info` and `GET /session/extend` read the
+    `CapdAccessToken` cookie rather than accepting a UUID in the path.
+
+    **Concurrent login handling** (create session): If a pre-existing DB session
+    exists for the same `callerId` + `userType`:
+    - If the DB session has expired → delete from DB, create new session.
+    - If not expired → delete from DB AND mark the Memcached session as `SESSION_TERMINATED`
+      before creating the new session.
+
+    **Endpoints not in original Swagger spec**: `/session/info`, `/session/extend`
+    are present in source but absent from the original auto-generated spec.
+
+    **Downstream dependencies**:
+    - Memcached (token store, configured via `memcached.*` config)
+    - Oracle DB (`EXTERNAL_USER_SESSION` table via `InternalAuthService`)
+    - `capd-external-user-auth-service` (for `PersistUserSessionRequest` DTO)
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: session
+    description: Session lifecycle management
+  - name: status
+    description: Application health check
+
+paths:
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application health check
+      operationId: getStatus
+      description: Returns plain text indicating service health.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/internal-auth/session:
+    post:
+      tags:
+        - session
+      summary: Create a new user session
+      operationId: createSession
+      description: |
+        Creates a new session for the user identified in the request body. Persists the
+        session to both Memcached and the `EXTERNAL_USER_SESSION` database table.
+
+        **Request body format** (text/plain): `{callerId}|{userType}` (pipe-separated).
+        - `callerId` must be a valid BigInteger.
+        - Must be exactly 2 pipe-separated segments.
+        - Any other format → HTTP 400 (`WrongSessionDetailsData` exception caught by outer catch).
+
+        **Concurrent login handling**: If a session already exists in DB for this
+        `callerId` + `userType`:
+        - If expired (`logInTimestamp + expirationTimeInSeconds < now`): delete from DB, create new.
+        - If not expired: delete from DB AND mark old Memcached session as `SESSION_TERMINATED`.
+
+        **Returns**: UUID string (the new session token, to be stored as `CapdAccessToken` cookie).
+
+        **HTTP 500**: `tokenStore.createSessionToken()` returned null (Memcached unavailable).
+        **HTTP 400**: Any exception during processing.
+      parameters:
+        - name: User-Agent
+          in: header
+          required: false
+          description: |
+            Browser/client user agent string. Stored with the session and used later
+            to validate `GET /session/{uuid}` requests from the same browser.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        description: |
+          Pipe-separated callerId and userType. Format: `{callerId}|{userType}`.
+          Example: `12345|external`
+        content:
+          text/plain:
+            schema:
+              type: string
+              example: '12345|external'
+      responses:
+        '200':
+          description: Session created. Response body is the UUID session token.
+          content:
+            text/plain:
+              schema:
+                type: string
+                description: UUID session token
+              example: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+        '400':
+          description: Invalid request body format or processing error
+        '500':
+          description: Unable to create new session (Memcached unavailable)
+
+  /api/internal-auth/session/{uuid}:
+    get:
+      tags:
+        - session
+      summary: Validate a session by UUID
+      operationId: validateSession
+      description: |
+        Validates the session token and returns session status. Used by Nginx/reverse proxy
+        to authorise portal requests.
+
+        **Response body** (text/plain): `{callerId}|{userType}||{status}` where:
+        - `callerId`: BigInteger person ID
+        - `userType`: user type string (e.g. "external", "internal")
+        - `status`: `SESSION_ACTIVE` or `SESSION_TERMINATED`
+
+        **`excludeTouch` header**: If `true`, the session's `lastActivityEpochMs` is NOT
+        updated (read-only validation). If `false` (default), last activity is updated
+        and session is saved back to Memcached.
+
+        **HTTP 401**: `SessionDoesNotExistUserAgentsDoNotMatchException` — session not found
+        in Memcached (expired or never existed) OR `User-Agent` does not match what was
+        used to create the session.
+
+        **HTTP 200 SESSION_TERMINATED**: Returned when session exists in Memcached but was
+        already terminated (e.g. concurrent login from another browser). The session is NOT
+        deleted from Memcached when terminated — it remains until TTL expiry.
+      parameters:
+        - name: uuid
+          in: path
+          required: true
+          description: Session UUID token (as created by POST /session)
+          schema:
+            type: string
+        - name: User-Agent
+          in: header
+          required: false
+          description: |
+            Browser/client user agent. Must match the User-Agent used to create the session,
+            otherwise HTTP 401 is returned.
+          schema:
+            type: string
+        - name: excludeTouch
+          in: header
+          required: false
+          description: |
+            If `true`, last activity timestamp is NOT updated (read-only validation).
+            Default: `false`.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: |
+            Session found. Body is pipe-separated: `{callerId}|{userType}||{status}`.
+            `status` is `SESSION_ACTIVE` or `SESSION_TERMINATED`.
+          content:
+            text/plain:
+              schema:
+                type: string
+              examples:
+                active:
+                  value: '12345|external||SESSION_ACTIVE'
+                terminated:
+                  value: '12345|external||SESSION_TERMINATED'
+        '401':
+          description: |
+            Session does not exist in Memcached (expired or invalid UUID), or User-Agent
+            does not match the agent used to create the session.
+
+    delete:
+      tags:
+        - session
+      summary: Delete a session by UUID
+      operationId: deleteSession
+      description: |
+        Deletes a session from both Memcached and the database. Fetches the session from
+        Memcached to resolve `callerId` and `userType` before deleting from DB.
+
+        **Behaviour when session not in Memcached**: Returns HTTP 200 silently (no error).
+        The DB record is only deleted if the session is found in Memcached.
+
+        **HTTP 500**: Any exception during deletion.
+      parameters:
+        - name: uuid
+          in: path
+          required: true
+          description: Session UUID token to delete
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session deleted (or UUID not found — treated as success)
+        '500':
+          description: Error deleting the session
+
+  /api/internal-auth/terminate-session:
+    put:
+      tags:
+        - session
+      summary: Terminate another user's session (by CS agent / operator)
+      operationId: terminateExternalUserSession
+      description: |
+        Terminates a session for the `callerId` specified in `PersistUserSessionRequest`.
+        Intended for use by CS agents locking external user sessions. The requesting
+        user is identified by `callerId` and `userType` headers.
+
+        **Logic**:
+        1. Look up DB session for `sessionRequest.callerId` + `userType`.
+        2. If found and not expired → delete from DB, mark Memcached session as `SESSION_TERMINATED`.
+        3. If found but expired → delete from DB only (Memcached already expired).
+        4. If not found → no-op (silently returns HTTP 200).
+
+        **HTTP 400**: Any exception during processing.
+
+        **Returns**: HTTP 200 void body.
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling (requesting) user
+          schema:
+            type: integer
+        - name: userType
+          in: header
+          required: false
+          description: User type of the calling user
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersistUserSessionRequest'
+      responses:
+        '200':
+          description: Session terminated successfully (or session did not exist)
+        '400':
+          description: Error processing the termination request
+
+  /api/internal-auth/verify-session/{callerId}/{userType}:
+    get:
+      tags:
+        - session
+      summary: Verify whether a session exists in the database
+      operationId: verifySessionInDatabase
+      description: |
+        Queries the `EXTERNAL_USER_SESSION` database table to check whether an active
+        session exists for `callerId` + `userType`.
+
+        **Returns**: `EXISTING_SESSION` if a session exists and has not expired; `NO_SESSION`
+        if no record found or the session has expired.
+
+        **Note**: This is a database check only — Memcached is NOT queried.
+
+        **HTTP 400**: Any exception during lookup.
+      parameters:
+        - name: callerId
+          in: path
+          required: true
+          description: Person identifier to check
+          schema:
+            type: integer
+        - name: userType
+          in: path
+          required: true
+          description: User type to check
+          schema:
+            type: string
+      responses:
+        '200':
+          description: |
+            Session status from the database.
+          content:
+            application/json:
+              schema:
+                type: string
+                enum:
+                  - EXISTING_SESSION
+                  - NO_SESSION
+              examples:
+                exists:
+                  value: 'EXISTING_SESSION'
+                notFound:
+                  value: 'NO_SESSION'
+        '400':
+          description: Error processing the verification request
+
+  /api/internal-auth/session/info:
+    get:
+      tags:
+        - session
+      summary: Get session info without touching the session
+      operationId: sessionInfo
+      description: |
+        Returns session status information (last activity timestamp, expiry duration)
+        without updating `lastActivityEpochMs`. Reads the `CapdAccessToken` cookie.
+
+        **Not in original Swagger spec** — endpoint exists in source code only.
+
+        **HTTP 401**: `CapdAccessToken` cookie missing/empty, session not found in Memcached,
+        or `User-Agent` does not match the session's recorded agent.
+      parameters:
+        - name: User-Agent
+          in: header
+          required: false
+          description: Must match the User-Agent used to create the session
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session info returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionStatusResponse'
+        '401':
+          description: Missing, expired, or mismatched session token
+
+  /api/internal-auth/session/extend:
+    get:
+      tags:
+        - session
+      summary: Validate session and return status (for session extension)
+      operationId: extendSession
+      description: |
+        Validates the session identified by the `CapdAccessToken` cookie. Returns session
+        status with `sessionExtendStatus=SESSION_EXTEND`. Unlike `/session/info`, this
+        endpoint signals intent to extend the session (front-end can use this to manage
+        keepalive).
+
+        **Not in original Swagger spec** — endpoint exists in source code only.
+
+        **HTTP 401**: `User-Agent` does not match session's recorded agent.
+        **HTTP 500**: Any other exception.
+      parameters:
+        - name: User-Agent
+          in: header
+          required: false
+          description: Must match the User-Agent used to create the session
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session extend status returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionStatusResponse'
+        '401':
+          description: User-Agent does not match session
+        '500':
+          description: Error validating or extending the session
+
+components:
+  schemas:
+    PersistUserSessionRequest:
+      type: object
+      x-validation-source: PersistUserSessionRequest.java (from capd-external-user-auth-service)
+      x-schema-incomplete: true
+      description: |
+        Request body for session termination. Contains the `callerId` of the user whose
+        session is to be terminated. Other fields may be present (source is in
+        `capd-external-user-auth-service` — not fully available in this workspace).
+      properties:
+        callerId:
+          type: integer
+          description: |
+            BigInteger identifier of the user whose session should be terminated.
+            Used to look up the session in the database.
+
+    SessionStatusResponse:
+      type: object
+      x-validation-source: SessionStatusResponse.java
+      description: Response object for session info and extend endpoints.
+      properties:
+        lastActivityEpochMs:
+          type: integer
+          format: int64
+          description: Epoch milliseconds of the session's last activity timestamp
+        expiresInSeconds:
+          type: integer
+          description: |
+            Session TTL in seconds (configured via `memcached.expirationTimeInSeconds`).
+            This is the total TTL — not the remaining time.
+        sessionExtendStatus:
+          type: string
+          description: |
+            `SESSION_INFO` when returned by `/session/info`;
+            `SESSION_EXTEND` when returned by `/session/extend`.
+          enum:
+            - SESSION_INFO
+            - SESSION_EXTEND
