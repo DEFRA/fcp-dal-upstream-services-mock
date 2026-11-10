@@ -1,0 +1,294 @@
+openapi: 3.1.0
+info:
+  title: KITS Internal User Authorisation API
+  description: >
+    API for retrieving the operations (functions) an internal user is authorised to perform, and
+    for mapping an internal user's email address to their personId. Consumers (e.g. SFD) use the
+    responses to show/hide functionality in their UI.
+    NOTE: DAL does not enforce these permissions - the upstream systems do.
+  version: '1.0.0'
+  license:
+    name: 'Open Government Licence v3.0'
+    url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3'
+security:
+  - mTLS: []
+servers:
+  - url: 'https://chs-upgrade-api.ruraldev.org.uk:8446/extapi'
+    description: 'The test server for KITS/V1 APIs'
+tags:
+  - name: 'authorisation'
+    description: 'Operations related to internal user authorisation'
+paths:
+  /authorisation/user:
+    post:
+      tags:
+        - 'authorisation'
+      summary: "Find a user's personId from their email address."
+      description: >
+        Looks up the person record matching the email address supplied as the raw request body and
+        returns its personId as a plain-text integer, or `0` when no person matches (including for
+        an empty or missing body). The upstream ignores the request Content-Type - the body is
+        always treated as the literal email string, so e.g. a JSON-quoted email does NOT match.
+      operationId: 'findByEmail'
+      requestBody:
+        description: 'The raw email address of the user to look up - not quoted or JSON-encoded.'
+        required: false
+        content:
+          text/plain:
+            schema:
+              type: string
+              examples:
+                - 'testuser01@defra.gov.uk'
+      responses:
+        '200':
+          description: >
+            Returns the matched personId, or `0` when no person has the given email address.
+          content:
+            text/plain:
+              schema:
+                type: integer
+                examples:
+                  - 5981843
+                  - 0
+        '400':
+          description: >
+            The request was rejected before reaching the service, e.g. by the upstream WAF
+            (typically as an empty-bodied 400).
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: >
+            The authenticated internal user (`email` header) is missing or unknown, or a WAF rule
+            has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          description: >
+            More than one person has the given email address. NOTE: this response is documented in
+            the upstream's published spec but is not reproducible on the test environment, so the
+            body shape is unverified.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 422
+                  message:
+                    type: string
+                    example: 'There is more than one person with email.'
+  /SitiAgriApi/authorisation/byFunction:
+    get:
+      tags:
+        - 'authorisation'
+        - 'permissions'
+      summary: 'Get authorised functions for an internal user.'
+      description: >
+        Returns, for each requested function, whether the internal user (identified by the `email`
+        header) is authorised to perform it. The consuming service supplies the pipe-separated
+        list of functions it is interested in via the `functions` query parameter, e.g.
+        `.../authorisation/byFunction?functions=viewLand|amendBusinessDetails&module=CUST_SS_PORTAL&timestamp=1720000000000`.
+      operationId: 'getInternalAuthorisationByFunction'
+      parameters:
+        - name: 'functions'
+          in: 'query'
+          description: >
+            Pipe-separated list of the functions to return an authorisation flag for. The upstream
+            does not validate the value - any unrecognised (or empty) function name is simply
+            echoed back with a `false` flag.
+          required: true
+          schema:
+            type: string
+            examples:
+              - 'viewLand|amendBusinessDetails'
+              - 'caseManagement|createNewCustomer|viewInternalUserLandingPage'
+        - name: 'module'
+          in: 'query'
+          description: >
+            The consuming module; `CUST_SS_PORTAL` for the self-service portal. The upstream does
+            not validate the value - an unrecognised module simply returns `false` for every
+            requested function.
+          required: true
+          schema:
+            type: string
+            examples:
+              - 'CUST_SS_PORTAL'
+        - name: 'timestamp'
+          in: 'query'
+          description: >
+            Request timestamp as epoch milliseconds. Callers are expected to supply it, but the
+            upstream does not require (or validate) it.
+          required: false
+          schema:
+            type: string
+            examples:
+              - '1720000000000'
+      responses:
+        '200':
+          description: Returns the requested functions mapped to their authorised boolean.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorisationByFunctionResponse'
+        '400':
+          description: >
+            The request was rejected before reaching the service, e.g. by the upstream WAF
+            (typically as an empty-bodied 400).
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: >
+            The authenticated internal user (`email` header) is missing or unknown, or a WAF rule
+            has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          description: >
+            Returned by the service (as its JSON error envelope, errorString "An error has
+            occurred.") whenever the `functions` or `module` query parameter is omitted - the
+            upstream 500s instead of returning a proper 400 for these bad requests. This is the
+            only known trigger; all other malformed input is accepted with a 200 (see the
+            parameter descriptions).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  responses:
+    BadRequest:
+      description: Bad Request response
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                example: 400
+              message:
+                type: string
+                example: 'HTTP 400 Bad Request'
+        text/plain:
+          schema:
+            type: string
+            example: ''
+        text/html:
+          schema:
+            type: string
+          examples:
+            badRequest:
+              summary: Bad Request HTML response
+              value: |
+                <html><body><h1>400 Bad request</h1>
+                Your browser sent an invalid request.
+                </body></html>
+    Forbidden:
+      description: Forbidden response
+      content:
+        text/html:
+          schema:
+            type: string
+          examples:
+            forbidden:
+              summary: Forbidden HTML response
+              value: |
+                <html><body><h1>403 Forbidden</h1>
+                Request forbidden by administrative rules.
+                </body></html>
+
+  schemas:
+    AuthorisationByFunctionResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          description: >
+            A map of requested function name to a boolean indicating whether the internal user is
+            authorised to perform it. Only the functions requested via `byFunction` are returned,
+            so every property is optional. The recognised internal-user functions are listed
+            below.
+          properties:
+            '3RD PARTY ADVISOR SUPPORT -SA': { type: boolean }
+            addOrRemoveOrTransferLand: { type: boolean }
+            addRoleOrPrivilege: { type: boolean }
+            amendApplication: { type: boolean }
+            amendBankAccountDetails: { type: boolean }
+            amendBusinessDetails: { type: boolean }
+            amendControlledBusinessInfo: { type: boolean }
+            amendELMApplications: { type: boolean }
+            amendEntitlements: { type: boolean }
+            amendLegallyResponsiblePeople: { type: boolean }
+            amendNewYoungFarmerProcess: { type: boolean }
+            applyForBPS: { type: boolean }
+            BANKDETAILSONLINECHANGE: { type: boolean }
+            caseManagement: { type: boolean }
+            closeBusiness: { type: boolean }
+            confirmBusiness: { type: boolean }
+            createBusinessNote: { type: boolean }
+            createCustomerNote: { type: boolean }
+            createInternalUserAccount: { type: boolean }
+            createNewBusiness: { type: boolean }
+            createNewCustomer: { type: boolean }
+            createNewIdentity: { type: boolean }
+            deleteBusiness: { type: boolean }
+            deleteIdentity: { type: boolean }
+            'EA ADVISOR SUPPORT -SA': { type: boolean }
+            'FC ADVISOR SUPPORT -SA': { type: boolean }
+            'HE ADVISOR SUPPORT -SA': { type: boolean }
+            modifyRoleOrPrivilege: { type: boolean }
+            'NE ADVISOR SUPPORT -SA': { type: boolean }
+            removeRoleOrPrivilege: { type: boolean }
+            resetAnyPassword: { type: boolean }
+            search: { type: boolean }
+            submitApplication: { type: boolean }
+            submitELMApplications: { type: boolean }
+            unlockInternalUserAccount: { type: boolean }
+            updateLandUse: { type: boolean }
+            upload_Alert: { type: boolean }
+            viewApplication: { type: boolean }
+            viewBusinessBankAccount: { type: boolean }
+            viewBusinessDetails: { type: boolean }
+            viewBusinessNotes: { type: boolean }
+            viewCountrysideStewardship: { type: boolean }
+            viewCPH: { type: boolean }
+            viewCSAgreements: { type: boolean }
+            viewCSApplications: { type: boolean }
+            viewCSClaims: { type: boolean }
+            viewCustomerNotes: { type: boolean }
+            viewELMApplications: { type: boolean }
+            viewEntitlements: { type: boolean }
+            viewInternalUserLandingPage: { type: boolean }
+            viewLand: { type: boolean }
+            viewLegallyResponsiblePeople: { type: boolean }
+          additionalProperties:
+            type: boolean
+        errorString:
+          type: [string, 'null']
+        success:
+          type: boolean
+      required:
+        - data
+        - errorString
+        - success
+      additionalProperties: false
+    ErrorResponse:
+      description: >
+        The service's JSON error envelope - the same wrapper as a success response, but with
+        `data` nulled, `success` false and the reason in `errorString`.
+      type: object
+      properties:
+        data:
+          type: 'null'
+        errorString:
+          type: string
+        success:
+          type: boolean
+      required:
+        - data
+        - errorString
+        - success
+      additionalProperties: false
+
+  securitySchemes:
+    mTLS:
+      type: mutualTLS
+      description: >
+        Mutual TLS authentication. Client must present a certificate issued by the server.

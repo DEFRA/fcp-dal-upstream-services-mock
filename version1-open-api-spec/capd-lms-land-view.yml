@@ -1,0 +1,1609 @@
+openapi: '3.0.1'
+info:
+  title: CAPD LMS Land View Service
+  version: v1
+  x-source-repository: capd-lms-land-view
+  description: |
+    Read-only service providing land parcel information, land cover data, geometries, and
+    spatial summaries from LMS (Land Management System). Implemented as a Dropwizard/Jersey
+    service. The vast majority of endpoints are GET-only and query an Oracle database.
+
+    **Upstream consumers**: Portal front-end, capd-frontends, internal mapping tools.
+    **Downstream dependencies**: LMS Oracle database (read-only spatial queries).
+
+    **Authentication / Authorisation**:
+    - All endpoints (except `/status`) require `callerId` and `userType` headers.
+    - Annotated with `@CapdOrganisationAuthorisation(functions = "VIEWLAND")` which validates
+      that the calling user (identified by `callerId` + `userType`) has VIEWLAND permission for
+      the given `organisationId`.
+    - POST `/lms/parcels` is annotated `@CapdSystemProcessEndpoint` (internal system use only).
+
+    **Exception handling**:
+    - `NotFoundException` / `ParcelNotFoundException` → HTTP 404, **plain text** body
+      (`NotFoundExceptionMapper`): message format for parcel: "Parcel {sheetId}{parcelId} not found".
+      Note: 404 responses are `text/plain`, not JSON. Consumers must handle this content type.
+    - `WebApplicationException` (e.g. missing bbox) → HTTP 400, error body
+    - Generic exceptions → HTTP 500 (default Dropwizard handler; may include stack trace in
+      non-production environments)
+
+    **Empty results**: Endpoints that return arrays will return HTTP 200 with an empty
+    array `[]` when no data matches the query — not HTTP 404. HTTP 404 is only returned
+    when a specific named resource (e.g. a parcel by sheetId/parcelId) is not found.
+
+    **Caching** (EhCache):
+    - The `/geometries` and `/geometries/single-cover` endpoints cache results keyed by
+      `organisationId + group + historicDate` when `bbox` parameter is "undefined" (all zeros).
+    - Cache heap size is configurable via `ehcacheMaxHeapMB` application config.
+
+    **Historic date format**: Historic date parameters are strings. The service uses
+    `LmsDateUtils` to parse them. Expected format: `yyyy-MM-dd` (ISO 8601 date). Invalid
+    or unparseable date strings may cause HTTP 500 with no structured error message.
+    Example: `2024-01-15`.
+
+    **BBox format**: Bounding box query parameter — comma-separated string `left,bottom,right,top`
+    (i.e. `minLon,minLat,maxLon,maxLat`). Pass all zeros ("0,0,0,0") to bypass spatial filtering
+    and use cached results.
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: status
+    description: Application health check
+  - name: organisation
+    description: Organisation-level parcel and land cover queries
+  - name: parcel
+    description: Individual parcel queries
+  - name: system
+    description: System-to-system endpoints
+
+paths:
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application health check
+      operationId: getStatus
+      description: Returns plain text indicating service health.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+              examples:
+                healthy:
+                  summary: Actual format is "{applicationName} is up"
+                  value: 'capd-lms-land-view is up'
+
+  /lms/organisation/{organisationId}/parcels:
+    get:
+      tags:
+        - organisation
+      summary: Get all parcels for an organisation
+      operationId: getParcels
+      description: |
+        Retrieves all parcels associated with `organisationId` without geometry. Calls
+        `organisationService.getParcels(organisationId)`.
+
+        **Authorization**: VIEWLAND required for `organisationId`.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: List of parcels for the organisation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelNoGeometry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/unique-parcels:
+    get:
+      tags:
+        - organisation
+      summary: Get unique parcels for an organisation
+      operationId: getUniqueParcels
+      description: |
+        Returns deduplicated parcel list for `organisationId`. Calls
+        `organisationService.getUniqueParcels(organisationId)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Unique parcel list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelNoGeometry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcels/single-cover:
+    get:
+      tags:
+        - organisation
+      summary: Get parcels with a single land cover type
+      operationId: getSingleCoverParcels
+      description: |
+        Returns parcels that have exactly one land cover type. Uses `organisationService.getBusinessReference()`
+        to resolve the business reference for the caller, then calls
+        `organisationService.getSingleCoverParcels(organisationId, businessReference)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Parcels with a single land cover type
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelNoGeometry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcels/bo-summary:
+    get:
+      tags:
+        - organisation
+      summary: Get land summary for Business Overview
+      operationId: getParcelsForBusinessOverview
+      description: |
+        Returns an aggregated land summary (total parcel count and total area) instead of the
+        full parcel list. Used on the Business Overview page for performance.
+        Calls `organisationService.getParcelsForBusinessOverview(organisationId)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Land summary with totals
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LandSummary'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcels/count:
+    get:
+      tags:
+        - organisation
+      summary: Get parcel count for an organisation
+      operationId: getParcelCount
+      description: |
+        Returns the number of parcels associated with this organisation. Gets business reference
+        from context, then calls `organisationService.getParcelCount(businessReference)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Parcel count
+          content:
+            application/json:
+              schema:
+                type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcels/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get all parcels for an organisation at a historic date
+      operationId: getParcelsHistoric
+      description: |
+        Returns all parcels as they existed at `historicDate`. Calls
+        `organisationService.getParcels(historicDate, organisationId)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Parcel list at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelNoGeometry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcels/group/{group}:
+    get:
+      tags:
+        - organisation
+      summary: Get parcels for an organisation filtered by group
+      operationId: getParcelsByGroup
+      description: |
+        Returns parcels for `organisationId` filtered by group identifier. Calls
+        `organisationService.getParcels(organisationId, group)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: group
+          in: path
+          required: true
+          description: Group identifier
+          schema:
+            type: string
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Parcels for the specified group
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelNoGeometry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcels/group/{group}/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get parcels for a group at a historic date
+      operationId: getParcelsByGroupHistoric
+      description: |
+        Returns parcels for `organisationId` filtered by group, as they existed at `historicDate`.
+        Calls `organisationService.getParcels(organisationId, group, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: group
+          in: path
+          required: true
+          description: Group identifier
+          schema:
+            type: string
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Group parcels at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelNoGeometry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcel-details/group/{group}/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get parcel details for a group at a historic date
+      operationId: getParcelDetailsByGroupHistoric
+      description: |
+        Returns detailed parcel records (validFrom/validTo dates) for parcels in the specified
+        group at `historicDate`. Calls `organisationService.getParcelDetails(organisationId, group, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: group
+          in: path
+          required: true
+          description: Group identifier
+          schema:
+            type: string
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Parcel details for group at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelDetails'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcel-details/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get all parcel details at a historic date
+      operationId: getParcelDetailsHistoric
+      description: |
+        Returns detailed parcel records for all parcels at `historicDate`. Calls
+        `organisationService.getParcelDetails(organisationId, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: All parcel details at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelDetails'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/land-covers:
+    get:
+      tags:
+        - organisation
+      summary: Get land cover information for all parcels
+      operationId: getLandCovers
+      description: |
+        Returns eligible land cover information for all parcels in the organisation. Gets
+        business reference from context, then calls
+        `organisationService.getLandCoversInfo(businessReference, null)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Eligible land cover information for all parcels
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EligibleLandCoversInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/land-covers/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get land cover information for all parcels at a historic date
+      operationId: getLandCoversHistoric
+      description: |
+        Returns eligible land cover information at `historicDate`. Calls
+        `organisationService.getLandCoversInfo(businessReference, null, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Land cover information at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EligibleLandCoversInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/land-covers/single:
+    get:
+      tags:
+        - organisation
+      summary: Get parcels with single land cover type and their cover info
+      operationId: getSingleLandCovers
+      description: |
+        Returns parcels that have a single land cover type, enriched with the cover code
+        and name. Calls `organisationService.getSingleLandCoversInfo(organisationId, businessReference)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Parcels with single land cover
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SingleLandCover'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/land-covers/grouped:
+    get:
+      tags:
+        - organisation
+      summary: Get land cover information for grouped parcels
+      operationId: getGroupedLandCovers
+      description: |
+        Returns land cover area information grouped into sets of `groupSize` parcels. Gets
+        business reference, then calls `organisationService.getGroupsLandCoversInfo(businessReference, groupSize)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: groupSize
+          in: query
+          required: false
+          description: Number of parcels per group. Default 3.
+          schema:
+            type: integer
+            default: 3
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Grouped land cover information
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EligibleLandCoversInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/land-covers/grouped/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get land cover information for grouped parcels at a historic date
+      operationId: getGroupedLandCoversHistoric
+      description: |
+        Returns grouped land cover information at `historicDate`. Calls
+        `organisationService.getGroupsLandCoversInfo(businessReference, groupSize, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/historicDate'
+        - name: groupSize
+          in: query
+          required: false
+          description: Number of parcels per group. Default 3.
+          schema:
+            type: integer
+            default: 3
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Grouped land cover information at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EligibleLandCoversInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/land-covers/group/{group}/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get land cover information for a specific group at a historic date
+      operationId: getGroupLandCoversHistoric
+      description: |
+        Returns land cover information for all parcels in `group` at `historicDate`. Calls
+        `organisationService.getLandCoversInfo(businessReference, group, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: group
+          in: path
+          required: true
+          description: Group identifier
+          schema:
+            type: string
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Group land cover information at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EligibleLandCoversInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/land-covers/parcel/{sheetId}/{parcelId}:
+    get:
+      tags:
+        - organisation
+      summary: Get land cover summary for a specific parcel
+      operationId: getLandCoversForParcel
+      description: |
+        Returns land cover area breakdown for a single parcel. Calls
+        `organisationService.getLandCoversSummaryForParcel(businessReference, sheetId, parcelId)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: sheetId
+          in: path
+          required: true
+          description: OS map sheet identifier
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Parcel identifier
+          schema:
+            type: string
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Land cover summary for the parcel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EligibleLandCoversInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/land-covers/parcel/{sheetId}/{parcelId}/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get land cover summary for a parcel at a historic date
+      operationId: getLandCoversForParcelHistoric
+      description: |
+        Returns land cover area breakdown for a parcel at `historicDate`. Calls
+        `organisationService.getLandCoversSummaryForParcel(businessReference, sheetId, parcelId, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: sheetId
+          in: path
+          required: true
+          description: OS map sheet identifier
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Parcel identifier
+          schema:
+            type: string
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Land cover summary for the parcel at historic date
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EligibleLandCoversInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/covers-summary:
+    get:
+      tags:
+        - organisation
+      summary: Get aggregated land cover summary for all parcels
+      operationId: getLandCoverSummary
+      description: |
+        Returns aggregated land cover area totals across all parcels. Calls
+        `organisationService.getLandCoverSummary(businessReference)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Aggregated land cover summary
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AreaInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/covers-summary/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get aggregated land cover summary at a historic date
+      operationId: getLandCoverSummaryHistoric
+      description: |
+        Returns aggregated land cover area totals at `historicDate`. Calls
+        `organisationService.getLandCoverSummary(businessReference, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Aggregated land cover summary at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AreaInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/covers-summary/group/{groupId}:
+    get:
+      tags:
+        - organisation
+      summary: Get land cover summary for a specific group
+      operationId: getLandCoverSummaryForGroup
+      description: |
+        Returns aggregated land cover area totals for parcels in `groupId`. Calls
+        `organisationService.getLandCoversSummary(businessReference, groupId)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: groupId
+          in: path
+          required: true
+          description: Group identifier
+          schema:
+            type: string
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Land cover summary for the group
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AreaInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/covers-summary/group/{groupId}/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get land cover summary for a group at a historic date
+      operationId: getLandCoverSummaryForGroupHistoric
+      description: |
+        Returns aggregated land cover area totals for `groupId` at `historicDate`. Calls
+        `organisationService.getLandCoversSummary(businessReference, groupId, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: groupId
+          in: path
+          required: true
+          description: Group identifier
+          schema:
+            type: string
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Group land cover summary at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AreaInfo'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/geometries:
+    get:
+      tags:
+        - organisation
+      summary: Get parcel geometries (GeoJSON feature collection) with bounding box filter
+      operationId: getParcelsGeometries
+      description: |
+        Returns parcel geometries as a GeoJSON feature collection, filtered by `bbox`.
+
+        **Validation** (from source):
+        - `bbox` is required — if absent, HTTP 400: "bbox query parameter must be specified"
+
+        **Caching** (EhCache): If `bbox` is "0,0,0,0" (undefined), the result is cached
+        keyed by `{organisationId}[+group][+historicDate]`. Subsequent requests with the same
+        key return the cached result. Cache heap is configurable (`ehcacheMaxHeapMB`, default
+        max 300KB per entry, max graph depth 2500 objects).
+
+        **Source**: `LmsOrganisationResource.java` (getParcelsGeometries),
+        `SpatialService.getParcelsGeometries()`
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: bbox
+          in: query
+          required: true
+          description: |
+            Bounding box as comma-separated string: `left,bottom,right,top` (minLon,minLat,maxLon,maxLat).
+            Pass `0,0,0,0` to retrieve all geometries (bypasses spatial filter, uses cache).
+          schema:
+            type: string
+            example: '-2.5,51.2,-1.5,52.0'
+        - name: group
+          in: query
+          required: false
+          description: Optional group filter. Part of the cache key when bbox is undefined.
+          schema:
+            type: string
+        - name: historicDate
+          in: query
+          required: false
+          description: Optional historic date filter. Part of the cache key when bbox is undefined.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: GeoJSON feature collection of parcel geometries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdFeatureCollectionParcel'
+        '400':
+          description: bbox query parameter was not specified
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/geometries/single-cover:
+    get:
+      tags:
+        - organisation
+      summary: Get single-cover parcel geometries with bounding box filter
+      operationId: getSingleCoverParcelsGeometries
+      description: |
+        Same as `/geometries` but filters to single-cover parcels only. Calls
+        `spatialService.getSingleCoverParcelsGeometries(organisationId, businessReference, bbox)`.
+
+        **Validation**: `bbox` required — HTTP 400 if absent.
+        **Caching**: Same strategy as `/geometries` — keyed by `{organisationId}` when bbox is undefined.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: bbox
+          in: query
+          required: true
+          description: Bounding box `left,bottom,right,top`. Pass `0,0,0,0` to use cache.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: GeoJSON feature collection of single-cover parcel geometries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdFeatureCollectionParcel'
+        '400':
+          description: bbox query parameter was not specified
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/centroids:
+    get:
+      tags:
+        - organisation
+      summary: Get parcel centroids for an organisation
+      operationId: getParcelsCentroids
+      description: |
+        Returns centroid coordinates (x, y) for all parcels. Optionally filtered by group.
+        Calls `spatialService.getParcelsCentroids(organisationId, group)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: group
+          in: query
+          required: false
+          description: Optional group filter
+          schema:
+            type: string
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: List of parcel centroids
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Centroid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/centroids/groups:
+    get:
+      tags:
+        - organisation
+      summary: Get group centroids for an organisation
+      operationId: getGroupsCentroids
+      description: |
+        Returns centroid geometries for each parcel group (GeoJSON feature collection).
+        Calls `spatialService.getGroupsCentroidsForOrganisation(organisationId, groupSize)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: groupSize
+          in: query
+          required: false
+          description: Number of parcels per group. Default 3.
+          schema:
+            type: integer
+            default: 3
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: GeoJSON feature collection of group centroids
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdFeatureCollectionGroupCentroids'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/national-character-areas:
+    get:
+      tags:
+        - organisation
+      summary: Get National Character Areas for an organisation
+      operationId: getNationalCharacterAreas
+      description: |
+        Returns National Character Areas (NCAs) associated with the organisation's land.
+        Gets business reference, then calls `organisationService.getNationalCharacterAreas(businessReference)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: National Character Areas for the organisation
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NationalCharacterArea'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcel/sheet-id/{sheetId}/parcel-id/{parcelId}:
+    get:
+      tags:
+        - parcel
+      summary: Get a parcel with full geometry
+      operationId: getParcel
+      description: |
+        Returns a single parcel with its GeoJSON geometry (as a GeoJSON Feature with
+        `properties` map). Calls `parcelService.getParcel(businessReference, sheetId, parcelId)`.
+
+        **Error**: `ParcelNotFoundException` → HTTP 404, body "Parcel {sheetId}{parcelId} not found"
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/sheetId'
+        - $ref: '#/components/parameters/parcelId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Parcel with GeoJSON geometry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParcelWithGeometryDTO'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcel/sheet-id/{sheetId}/parcel-id/{parcelId}/attributes-only:
+    get:
+      tags:
+        - parcel
+      summary: Get a parcel without geometry (attributes only)
+      operationId: getParcelAttributesOnly
+      description: |
+        Returns parcel attributes (sheetId, parcelId, area, pendingDigitisation, validFrom,
+        validTo) without the geometry payload. Calls
+        `parcelService.getParcelWithAttributesOnly(businessReference, sheetId, parcelId)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/sheetId'
+        - $ref: '#/components/parameters/parcelId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Parcel attributes without geometry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParcelNoGeometry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcel/sheet-id/{sheetId}/parcel-id/{parcelId}/historic/{historicDate}/attributes-only:
+    get:
+      tags:
+        - parcel
+      summary: Get parcel attributes at a historic date
+      operationId: getParcelAttributesOnlyHistoric
+      description: |
+        Returns parcel attributes at `historicDate`. Calls
+        `parcelService.getParcelWithAttributesOnly(businessReference, sheetId, parcelId, historicDate)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/sheetId'
+        - $ref: '#/components/parameters/parcelId'
+        - $ref: '#/components/parameters/historicDate'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Parcel attributes at historic date
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParcelNoGeometry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcel/sheet-id/{sheetId}/parcel-id/{parcelId}/related:
+    get:
+      tags:
+        - parcel
+      summary: Check if a parcel exists for the organisation
+      operationId: hasParcel
+      description: |
+        Returns a boolean indicating whether the specified parcel exists for the organisation.
+        Calls `organisationService.hasParcel(businessReference, sheetId, parcelId)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/sheetId'
+        - $ref: '#/components/parameters/parcelId'
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Boolean — true if the parcel exists, false otherwise
+          content:
+            application/json:
+              schema:
+                type: boolean
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcel/sheet-id/{sheetId}/parcel-id/{parcelId}/land-covers:
+    get:
+      tags:
+        - parcel
+      summary: Get land covers for a parcel (optionally with geometries)
+      operationId: getParcelLandCovers
+      description: |
+        Returns land covers for a parcel as a GeoJSON feature collection. Each feature
+        has a `properties` map with `code`, `name`, `area`, `isBpsEligible`. Calls
+        `parcelService.getParcelLandCovers(sheetId, parcelId, includeGeometries)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/sheetId'
+        - $ref: '#/components/parameters/parcelId'
+        - name: includeGeometries
+          in: query
+          required: false
+          description: Whether to include geometry data in each feature. Default false.
+          schema:
+            type: boolean
+            default: false
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Land cover feature collection for the parcel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdFeatureCollectionLandCovers'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcel/sheet-id/{sheetId}/parcel-id/{parcelId}/historic/{historicDate}/land-covers:
+    get:
+      tags:
+        - parcel
+      summary: Get land covers for a parcel at a historic date
+      operationId: getParcelLandCoversHistoric
+      description: |
+        Returns land covers for a parcel at `historicDate`. Calls
+        `parcelService.getParcelLandCovers(sheetId, parcelId, historicDate, includeGeometries)`.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/sheetId'
+        - $ref: '#/components/parameters/parcelId'
+        - $ref: '#/components/parameters/historicDate'
+        - name: includeGeometries
+          in: query
+          required: false
+          description: Whether to include geometry data. Default false.
+          schema:
+            type: boolean
+            default: false
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+      responses:
+        '200':
+          description: Land cover feature collection at historic date
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdFeatureCollectionLandCovers'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/organisation/{organisationId}/parcel/sheet-id/{sheetId}/parcel-id/{parcelId}/land-covers/geometries:
+    get:
+      tags:
+        - parcel
+      summary: Get land cover geometries only for a parcel
+      operationId: getParcelLandCoverGeometries
+      description: |
+        Returns land cover feature geometries (no attributes) for a parcel. Calls
+        `spatialService.getLandCoversFeatures(sheetId, parcelId)`.
+
+        **HTTP 204**: Returned when no land cover features exist for the parcel.
+
+        **Note**: `callerId` and `userType` headers are not required on this endpoint
+        based on the source — only `sheetId` and `parcelId` are consumed.
+
+        **Authorization**: VIEWLAND required.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/sheetId'
+        - $ref: '#/components/parameters/parcelId'
+      responses:
+        '200':
+          description: Land cover geometry feature collection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdFeatureCollectionLandCoverGeometry'
+        '204':
+          description: No land cover features found for the parcel
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /lms/parcels:
+    post:
+      tags:
+        - system
+      summary: Get parcels by parcel reference list (internal system endpoint)
+      operationId: getParcelsByReferences
+      description: |
+        Accepts a list of parcel references (sheetId + parcelId pairs) and returns matching
+        parcel details. Annotated `@CapdSystemProcessEndpoint` — not for direct portal use.
+        Calls `organisationService.getParcels(parcelReferences)`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/ParcelReference'
+      responses:
+        '200':
+          description: Parcels matching the provided references
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelNoGeometry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  parameters:
+    organisationId:
+      name: organisationId
+      in: path
+      required: true
+      description: Internal organisation identifier (Long)
+      schema:
+        type: integer
+        format: int64
+    callerId:
+      name: callerId
+      in: header
+      required: true
+      description: |
+        Identifier of the calling user (BigInteger). Used for VIEWLAND authorisation check
+        via `@CapdOrganisationAuthorisation`.
+      schema:
+        type: integer
+    userType:
+      name: userType
+      in: header
+      required: true
+      description: |
+        User type classification. Used with `callerId` to resolve business reference and
+        perform VIEWLAND authorisation.
+      schema:
+        type: string
+        enum:
+          - internal
+          - external
+          - ida_no_match
+    historicDate:
+      name: historicDate
+      in: path
+      required: true
+      description: |
+        Date for historical data retrieval. Parsed by `LmsDateUtils`. Format: ISO 8601
+        date string (e.g. `2022-01-20`).
+      schema:
+        type: string
+        example: '2022-01-20'
+    sheetId:
+      name: sheetId
+      in: path
+      required: true
+      description: OS map sheet identifier
+      schema:
+        type: string
+    parcelId:
+      name: parcelId
+      in: path
+      required: true
+      description: Parcel identifier within the OS sheet
+      schema:
+        type: string
+
+  responses:
+    NotFound:
+      description: |
+        Resource not found. Body is plain text (`NotFoundExceptionMapper`).
+        For parcel lookups: "Parcel {sheetId}{parcelId} not found"
+      content:
+        text/plain:
+          schema:
+            type: string
+    InternalError:
+      description: Unexpected service error
+      content:
+        application/json:
+          schema:
+            type: object
+
+  schemas:
+    ParcelNoGeometry:
+      type: object
+      x-validation-source: ParcelNoGeometry.java (entity)
+      description: |
+        Land parcel record without geometry. Stored in LMS database.
+        `validFrom`/`validTo` are `@Transient` (not in DB, populated from queries).
+      properties:
+        id:
+          type: integer
+          description: Unique parcel identifier (BigInteger)
+        sheetId:
+          type: string
+          description: OS map sheet identifier
+        parcelId:
+          type: string
+          description: Parcel identifier within the sheet
+        area:
+          type: number
+          description: Parcel area (typically in hectares)
+        pendingDigitisation:
+          type: boolean
+          description: True if the parcel is awaiting digitisation. Defaults to false.
+        validFrom:
+          type: string
+          description: Parcel validity start date (transient — from query)
+        validTo:
+          type: string
+          description: Parcel validity end date (transient — from query)
+
+    ParcelDetails:
+      type: object
+      x-validation-source: ParcelDetails.java
+      description: Detailed parcel record with explicit validity dates.
+      properties:
+        sheetId:
+          type: string
+        parcelId:
+          type: string
+        validFrom:
+          type: string
+          format: date
+        validTo:
+          type: string
+          format: date
+
+    ParcelWithGeometryDTO:
+      type: object
+      x-validation-source: ParcelWithGeometryDTO.java
+      description: |
+        GeoJSON Feature representing a parcel with full geometry. The `properties` map
+        contains: sheetId, parcelId, area (as string), pendingDigitisation (as string).
+        `type` is hardcoded as "Feature".
+      properties:
+        id:
+          type: integer
+          description: Unique parcel identifier
+        type:
+          type: string
+          description: GeoJSON type (always "Feature")
+          example: Feature
+        geometry:
+          $ref: '#/components/schemas/GeoJsonGeometry'
+        properties:
+          type: object
+          description: |
+            Feature properties map. Keys: sheetId, parcelId, area, pendingDigitisation.
+          additionalProperties:
+            type: string
+
+    LandSummary:
+      type: object
+      x-validation-source: LandSummary.java
+      description: Aggregated land summary for Business Overview.
+      properties:
+        totalParcels:
+          type: integer
+          description: Total number of parcels
+        totalArea:
+          type: number
+          description: Total land area across all parcels (in hectares)
+
+    EligibleLandCoversInfo:
+      type: object
+      x-validation-source: EligibleLandCoversInfo.java
+      description: |
+        Land cover area information for a parcel or group. `id` is the parcel/group identifier,
+        `info` is a list of land cover area breakdowns.
+      properties:
+        id:
+          type: string
+          description: Parcel ID, group ID, or other identifier
+        info:
+          type: array
+          items:
+            $ref: '#/components/schemas/AreaInfo'
+
+    AreaInfo:
+      type: object
+      x-validation-source: EligibleLandCoversInfo.AreaInfo (nested class)
+      description: Land cover area breakdown entry.
+      properties:
+        code:
+          type: string
+          description: Land cover classification code
+        name:
+          type: string
+          description: Land cover type name
+        area:
+          type: number
+          description: Area of this land cover type (in hectares)
+
+    SingleLandCover:
+      type: object
+      x-validation-source: SingleLandCover.java
+      description: Parcel with a single land cover type. Extends ParcelNoGeometry.
+      allOf:
+        - $ref: '#/components/schemas/ParcelNoGeometry'
+        - type: object
+          properties:
+            areaCode:
+              type: string
+              description: Land cover type classification code
+            areaName:
+              type: string
+              description: Land cover type name
+
+    NationalCharacterArea:
+      type: object
+      x-validation-source: NationalCharacterArea.java
+      description: A National Character Area associated with the organisation's land.
+      properties:
+        code:
+          type: string
+          description: NCA code identifier
+        name:
+          type: string
+          description: NCA name
+        statementOfPrioritiesURL:
+          type: string
+          description: URL to the NCA statement of priorities document
+
+    Centroid:
+      type: object
+      x-validation-source: Centroid.java
+      description: 2D coordinate centroid point for a parcel.
+      properties:
+        x:
+          type: number
+          description: X coordinate (longitude / easting)
+        y:
+          type: number
+          description: Y coordinate (latitude / northing)
+
+    ParcelReference:
+      type: object
+      x-validation-source: ParcelReference.java
+      description: A reference to a specific parcel used for batch parcel lookup.
+      properties:
+        sheetId:
+          type: string
+          description: OS map sheet identifier
+        parcelId:
+          type: string
+          description: Parcel identifier
+
+    GeoJsonGeometry:
+      type: object
+      x-schema-incomplete: true
+      description: |
+        JTS Geometry serialised as GeoJSON. Type may be Polygon, MultiPolygon, Point, etc.
+        Exact structure depends on the parcel geometry stored in LMS.
+      properties:
+        type:
+          type: string
+          example: Polygon
+        coordinates:
+          type: array
+          description: GeoJSON coordinate array (structure depends on type)
+          items: {}
+
+    CapdFeatureCollectionParcel:
+      type: object
+      description: GeoJSON-style feature collection of parcel geometries.
+      properties:
+        features:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParcelWithGeometryDTO'
+
+    CapdFeatureCollectionLandCovers:
+      type: object
+      description: GeoJSON-style feature collection of land cover features.
+      properties:
+        features:
+          type: array
+          items:
+            $ref: '#/components/schemas/LandCoverDTO'
+
+    CapdFeatureCollectionLandCoverGeometry:
+      type: object
+      description: GeoJSON-style feature collection of land cover geometry-only features.
+      properties:
+        features:
+          type: array
+          items:
+            $ref: '#/components/schemas/LandCoverGeometryOnly'
+
+    CapdFeatureCollectionGroupCentroids:
+      type: object
+      description: GeoJSON-style feature collection of group centroids.
+      properties:
+        features:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupWithCentroidDTO'
+
+    LandCoverDTO:
+      type: object
+      x-validation-source: LandCoverDTO.java
+      description: |
+        GeoJSON Feature for a land cover entry. `properties` map contains: code, name,
+        area (as string), isBpsEligible (as string). `geometry` may be null if
+        `includeGeometries=false`.
+      properties:
+        id:
+          type: number
+          description: Unique land cover identifier
+        type:
+          type: string
+          description: GeoJSON type (always "Feature")
+          example: Feature
+        geometry:
+          $ref: '#/components/schemas/GeoJsonGeometry'
+        properties:
+          type: object
+          description: |
+            Land cover properties map. Keys: code, name, area, isBpsEligible.
+          additionalProperties:
+            type: string
+
+    LandCoverGeometryOnly:
+      type: object
+      x-validation-source: LandCoverGeometryOnly.java
+      description: GeoJSON Feature with only the geometry (no properties).
+      properties:
+        id:
+          type: integer
+          description: Unique land cover identifier
+        type:
+          type: string
+          description: GeoJSON type (always "Feature")
+          example: Feature
+        geometry:
+          $ref: '#/components/schemas/GeoJsonGeometry'
+
+    GroupWithCentroidDTO:
+      type: object
+      x-validation-source: GroupWithCentroidDTO.java
+      description: |
+        GeoJSON Feature representing a parcel group centroid. `properties` map
+        contains featureCount (number of parcels in the group, as string).
+      properties:
+        groupId:
+          type: string
+          description: Parcel group identifier
+        type:
+          type: string
+          description: GeoJSON type (always "Feature")
+          example: Feature
+        geometry:
+          $ref: '#/components/schemas/GeoJsonGeometry'
+        properties:
+          type: object
+          description: Group properties. Keys include featureCount.
+          additionalProperties:
+            type: string

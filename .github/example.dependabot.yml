@@ -8,6 +8,10 @@ updates:
 
     # Group packages into shared PR
     groups:
+      build:
+        patterns:
+          - 'autoprefixer'
+
       lint:
         patterns:
           - 'prettier'
@@ -27,6 +31,10 @@ updates:
           - 'vitest'
           - 'nodemon'
           - 'npm-run-all'
+
+      types:
+        patterns:
+          - '@types/*'
 
     ignore:
       - dependency-name: 'eslint-*'

@@ -1,8 +1,21 @@
-import neostandard from 'neostandard'
+import { defineConfig, globalIgnores } from 'eslint/config'
+import globals from 'globals'
 
-export default neostandard({
-  env: ['node', 'vitest'],
-  ignores: [...neostandard.resolveIgnoresFromGitignore()],
-  noJsx: true,
-  noStyle: true
-})
+export default defineConfig([
+  {
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      globals: {
+        ...globals.node
+      }
+    },
+    rules: {
+      'no-unused-vars': [
+        'error',
+        { ignoreRestSiblings: true, argsIgnorePattern: '^_' }
+      ]
+    }
+  },
+  globalIgnores(['coverage', 'version1-open-api-spec'])
+])

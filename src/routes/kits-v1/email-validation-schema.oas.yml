@@ -1,0 +1,150 @@
+openapi: 3.1.0
+info:
+  title: Email validation API
+  description: API for saving and validating a person's email verification link
+  version: '1.0.0'
+  license:
+    name: 'Open Government Licence v3.0'
+    url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3'
+security:
+  - mTLS: []
+servers:
+  - url: 'https://chs-upgrade-api.ruraldev.org.uk:8446/extapi'
+    description: 'The test server for KITS/V1 APIs'
+tags:
+  - name: 'email-validation'
+    description: 'Operations related to email address verification'
+paths:
+  /external-auth/email-validation:
+    post:
+      tags:
+        - 'email-validation'
+      summary: 'Save an email validation record'
+      description: >
+        Saves or replaces the email validation record for a customer reference. Replacing an
+        existing record for the same CRN always succeeds with 200, even when the email is
+        unchanged. The customer reference and party digital contact ID are not checked against
+        existing records, and the email is not checked against the party digital contact, so an
+        unknown CRN, unknown party digital contact ID or mismatched email is still saved with
+        200. Existing records for other CRNs are not checked, so the same email can be saved
+        for more than one CRN.
+      operationId: 'saveEmailValidation'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailValidationRequest'
+      responses:
+        '200':
+          description: 'Email validation record saved.'
+        '500':
+          description: >
+            Internal server error. A missing customerReference returns a Jersey error body; a
+            missing partyDigitalContactId or email returns an unhandled exception body with a log
+            ID.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/JerseyErrorResponse'
+                  - $ref: '#/components/schemas/UnhandledErrorResponse'
+  /external-auth/email-validation/validate-email:
+    post:
+      tags:
+        - 'email-validation'
+      summary: 'Validate an email verification link'
+      description: >
+        Validates a previously saved email validation record matched by party digital contact
+        ID and email. The customer reference in the request is not used for matching.
+        On success the person's email address is updated to the validated email if it differs.
+      operationId: 'validateEmail'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailValidationRequest'
+      responses:
+        '200':
+          description: 'Email validated successfully.'
+        '401':
+          description: 'Email verification link has expired.'
+        '404':
+          description: 'No matching email validation record found.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JerseyErrorResponse'
+
+components:
+  schemas:
+    EmailValidationRequest:
+      type: 'object'
+      additionalProperties: false
+      properties:
+        customerReference:
+          type: 'string'
+          maxLength: 10
+          description: 'Customer Reference Number (CRN) of the person.'
+        partyDigitalContactId:
+          type: 'integer'
+          description: 'Party digital contact ID.'
+        email:
+          type: 'string'
+          format: 'email'
+          description: 'Email address to validate.'
+        linkSentDate:
+          type: 'string'
+          format: 'date-time'
+          description: >
+            Timestamp when the validation link was sent.
+      required:
+        - 'customerReference'
+        - 'partyDigitalContactId'
+        - 'email'
+      example:
+        customerReference: '9111111100'
+        partyDigitalContactId: 123456
+        email: 'person@example.com'
+        linkSentDate: '2023-10-01T12:00:00Z'
+    JerseyErrorResponse:
+      description: 'Jersey servlet error body returned for 404 and 500 responses.'
+      type: 'object'
+      properties:
+        servlet:
+          type: 'string'
+          example: 'jersey'
+        message:
+          type: 'string'
+          example: 'Not Found'
+        url:
+          type: 'string'
+          example: '/external-auth/email-validation/validate-email'
+        status:
+          type: 'string'
+          example: '404'
+      required:
+        - 'servlet'
+        - 'message'
+        - 'url'
+        - 'status'
+    UnhandledErrorResponse:
+      description: 'Error body returned for an unhandled server exception.'
+      type: 'object'
+      properties:
+        code:
+          type: 'integer'
+          example: 500
+        message:
+          type: 'string'
+          example: 'There was an error processing your request. It has been logged (ID 306542aad8b1dd09).'
+      required:
+        - 'code'
+        - 'message'
+
+  securitySchemes:
+    mTLS:
+      type: mutualTLS
+      description: >
+        Mutual TLS authentication. Client must present a certificate issued by the server.

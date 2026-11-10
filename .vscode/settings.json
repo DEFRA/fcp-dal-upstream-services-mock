@@ -1,0 +1,72 @@
+{
+  "files.autoSave": "onFocusChange",
+  "editor.codeActions.triggerOnFocusChange": true,
+  "editor.codeActionsOnSave": {
+    "source.addMissingImports.ts": "explicit",
+    "source.organizeImports": "explicit",
+    "source.removeUnusedImports": "explicit",
+    "source.fixAll.eslint": "always",
+    "source.sortImports": "explicit"
+  },
+  "eslint.validate": ["javascript"],
+  "prettier.enable": true,
+  "prettier.configPath": "prettier.config.js",
+  "prettier.requireConfig": true,
+  "prettier.useEditorConfig": false,
+  "prettier.printWidth": 100,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.formatOnSave": true,
+  "editor.tabSize": 2,
+  "cSpell.words": [
+    "Agri",
+    "AGRLIV",
+    "apidevtools",
+    "APPCRE",
+    "APPROV",
+    "bbox",
+    "Capd",
+    "CHEAPP",
+    "cphs",
+    "defra",
+    "defradigital",
+    "DOMPRS",
+    "extapi",
+    "healthcheck",
+    "IDRAFT",
+    "legalstatus",
+    "nationalarchives",
+    "NINO",
+    "nodemon",
+    "PAYPRO",
+    "pino",
+    "recased",
+    "redocly",
+    "schemathesis",
+    "Siti",
+    "sitiagri",
+    "sonarcloud",
+    "STADOM",
+    "TRUSTSTORE",
+    "unconfirm",
+    "Ungrazeable",
+    "uprn",
+    "WTHDRW"
+  ],
+  "cSpell.ignorePaths": [
+    ".git",
+    ".husky/_",
+    ".vscode",
+    "coverage",
+    "node_modules",
+    "package-lock.json"
+  ],
+  "cSpell.language": "en,en-GB",
+  "yaml.schemas": {
+    "https://spec.openapis.org/oas/3.1/schema/2022-10-07": [
+      "*.oas.yaml",
+      "*.oas.yml"
+    ]
+  },
+  "yaml.validate": true,
+  "yaml.format.enable": true
+}

@@ -1,0 +1,470 @@
+openapi: 3.1.0
+info:
+  title: CAPD LMS Land View Service
+  description: |
+    Read-only service providing land parcel information, land cover data, geometries, and
+    spatial summaries from LMS (Land Management System).
+  version: '1.0.0'
+  license:
+    name: 'Open Government Licence v3.0'
+    url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3'
+security:
+  - mTLS: []
+servers:
+  - url: 'https://chs-upgrade-api.ruraldev.org.uk:8446/extapi'
+    description: The test server for KITS/V1 APIs
+paths:
+  /lms/organisation/{organisationId}/parcels/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get all parcels for an organisation at a historic date
+      operationId: getParcelsHistoric
+      description: |
+        Returns all parcels as they existed at `historicDate`.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/historicDate'
+      responses:
+        '200':
+          description: Parcel list at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelNoGeometry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Returned by upstream if organisationId or historicDate has an invalid format
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /lms/organisation/{organisationId}/parcel-details/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get all parcel details at a historic date
+      operationId: getParcelDetailsHistoric
+      description: |
+        Returns detailed parcel records for all parcels at `historicDate`.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/historicDate'
+      responses:
+        '200':
+          description: All parcel details at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ParcelDetails'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Returned by upstream if organisationId or historicDate has an invalid format
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /lms/organisation/{organisationId}/parcel/sheet-id/{sheetId}/parcel-id/{parcelId}/historic/{historicDate}/land-covers:
+    get:
+      tags:
+        - parcel
+      summary: Get land covers for a parcel at a historic date
+      operationId: getParcelLandCoversHistoric
+      description: |
+        Returns land covers for a parcel at `historicDate`. Calls
+        `parcelService.getParcelLandCovers(sheetId, parcelId, historicDate, includeGeometries)`.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/sheetId'
+        - $ref: '#/components/parameters/parcelId'
+        - $ref: '#/components/parameters/historicDate'
+        - name: includeGeometries
+          in: query
+          required: false
+          description: Whether to include geometry data. Default false.
+          schema:
+            type: string
+            default: 'false'
+      responses:
+        '200':
+          description: Land cover feature collection at historic date
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdFeatureCollectionLandCovers'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Returned by upstream if any of the parameters are badly formed
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /lms/organisation/{organisationId}/covers-summary/historic/{historicDate}:
+    get:
+      tags:
+        - organisation
+      summary: Get aggregated land cover summary at a historic date
+      operationId: getLandCoverSummaryHistoric
+      description: |
+        Returns aggregated land cover area totals at `historicDate`.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - $ref: '#/components/parameters/historicDate'
+      responses:
+        '200':
+          description: Aggregated land cover summary at historic date
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AreaInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Returned by upstream if historicDate has an invalid format
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          description: |
+            Returned by upstream if org can't be found, or if historicDate cannot be
+            parsed as a date (see `InternalServerError`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /lms/organisation/{organisationId}/geometries:
+    get:
+      tags:
+        - organisation
+      summary: Get parcel geometries (GeoJSON feature collection) with bounding box filter
+      operationId: getParcelsGeometries
+      description: |
+        Returns parcel geometries as a GeoJSON feature collection, filtered by `bbox`.
+      parameters:
+        - $ref: '#/components/parameters/organisationId'
+        - name: bbox
+          in: query
+          required: true
+          description: |
+            Bounding box as comma-separated string: `left,bottom,right,top` (minLon,minLat,maxLon,maxLat).
+            Pass `0,0,0,0` to retrieve all geometries
+          schema:
+            type: string
+            minLength: 1
+            examples: ['0,0,0,0']
+        - name: group
+          in: query
+          required: false
+          description: Optional group filter. (Not used by mock)
+          schema:
+            type: string
+        - name: historicDate
+          in: query
+          required: false
+          description: Optional historic date filter.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: GeoJSON feature collection of parcel geometries (empty feature list if organisationId/bbox combination results in no match)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdFeatureCollectionParcel'
+        '400':
+          description: |
+            Returned by upstream if bounding box is not supplied, or by upstream
+            infrastructure (proxy/Jetty) if the URI is malformed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: |
+            Returned by upstream if bounding box is not formatted correctly, or if
+            organisationId overflows a Java Long (values above 9223372036854775807
+            that still pass the gateway's 19-digit limit).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Returned by upstream if organisationId has an invalid format
+          content:
+            text/html:
+              schema:
+                type: string
+
+components:
+  parameters:
+    organisationId:
+      name: organisationId
+      in: path
+      required: true
+      description: Internal organisation identifier (Long)
+      schema:
+        type: integer
+        format: int64
+        examples: [1111111111] # sfd-id-check: allow - organisation ID
+    historicDate:
+      name: historicDate
+      in: path
+      required: true
+      description: |
+        Date for historical data retrieval. Format: `DD-MMM-YY` date string (e.g. `19-Jul-24`).
+        The pattern documents the accepted shape - anything else is rejected before or by
+        upstream (proxy/Jetty 400/404 for URI garbage, app-level 403/500 otherwise).
+      schema:
+        type: string
+        # NOTE: [0-9] rather than \d - schemathesis generates via Python `re`,
+        # where \d matches any Unicode digit, and such dates 502 in the test
+        # proxy chain before ever reaching upstream
+        pattern: '^[0-9]{2}-[A-Za-z]{3}-[0-9]{2}$'
+        examples: ['19-Jul-24']
+    sheetId:
+      name: sheetId
+      in: path
+      required: true
+      description: OS map sheet identifier
+      schema:
+        type: string
+        examples: ['TE0001']
+    parcelId:
+      name: parcelId
+      in: path
+      required: true
+      description: Parcel identifier within the OS sheet
+      schema:
+        type: string
+        examples: ['1001']
+
+  securitySchemes:
+    mTLS:
+      type: mutualTLS
+      description: >
+        Mutual TLS authentication. Client must present a certificate issued by the server.
+
+  responses:
+    BadRequest:
+      description: |
+        Returned by upstream infrastructure (proxy/Jetty) if the URI is malformed -
+        e.g. control characters, backslashes or empty path segments (`Bad Message 400`).
+      content:
+        text/html:
+          schema:
+            type: string
+          examples:
+            badRequest:
+              summary: Jetty bad message HTML response
+              value: |
+                <h1>Bad Message 400</h1><pre>reason: Ambiguous URI empty segment</pre>
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: |
+        Returned by upstream if organisationId overflows a Java Long (values above
+        9223372036854775807 that still pass the gateway's 19-digit limit), or if
+        path mangling (e.g. a `#` in a path parameter) leaves no matching route.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            notFound:
+              summary: JAX-RS not found response
+              value: { 'code': 404, 'message': 'HTTP 404 Not Found' }
+    InternalServerError:
+      description: |
+        Returned by upstream if historicDate matches the `DD-MMM-YY` pattern but cannot
+        be strictly parsed as a date - e.g. an unknown or non-exact-case month
+        abbreviation (`00-AAA-00`, `00-jul-24`) or a day outside 01-31 (`99-Jul-24`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            internalServerError:
+              summary: Logged server error response
+              value:
+                {
+                  'code': 500,
+                  'message': 'There was an error processing your request. It has been logged (ID 7f693ddc6eef88a2).'
+                }
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+        message:
+          type: string
+    ParcelNoGeometry:
+      type: object
+      x-validation-source: ParcelNoGeometry.java (entity)
+      description: |
+        Land parcel record without geometry.
+      properties:
+        id:
+          type: integer
+          description: Unique parcel identifier (BigInteger)
+        sheetId:
+          type: string
+          description: OS map sheet identifier
+        parcelId:
+          type: string
+          description: Parcel identifier within the sheet
+        area:
+          type: number
+          description: Parcel area (typically in hectares)
+        pendingDigitisation:
+          type: boolean
+          description: True if the parcel is awaiting digitisation. Defaults to false.
+        validFrom:
+          type: ['string', 'null']
+          description: Parcel validity start date (transient — from query)
+        validTo:
+          type: ['string', 'null']
+          description: Parcel validity end date (transient — from query)
+
+    ParcelDetails:
+      type: object
+      x-validation-source: ParcelDetails.java
+      description: Detailed parcel record with explicit validity dates.
+      properties:
+        sheetId:
+          type: string
+        parcelId:
+          type: string
+        validFrom:
+          type: integer
+          description: Validity start date as epoch milliseconds
+        validTo:
+          type: integer
+          description: Validity end date as epoch milliseconds
+    ParcelWithGeometryDTO:
+      type: object
+      x-validation-source: ParcelWithGeometryDTO.java
+      description: |
+        GeoJSON Feature representing a parcel with full geometry. The `properties` map
+        contains: sheetId, parcelId, area (as string), pendingDigitisation (as string).
+        `type` is hardcoded as "Feature".
+      properties:
+        id:
+          type: integer
+          description: Unique parcel identifier
+        type:
+          type: string
+          description: GeoJSON type (always "Feature")
+          example: Feature
+        geometry:
+          $ref: '#/components/schemas/GeoJsonGeometry'
+        properties:
+          type: object
+          description: |
+            Feature properties map. Keys: sheetId, parcelId, area, pendingDigitisation.
+          additionalProperties:
+            type: string
+    CapdFeatureCollectionParcel:
+      type: object
+      description: GeoJSON-style feature collection of parcel geometries.
+      properties:
+        features:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParcelWithGeometryDTO'
+
+    CapdFeatureCollectionLandCovers:
+      type: object
+      description: GeoJSON-style feature collection of land cover features.
+      properties:
+        features:
+          type: array
+          items:
+            $ref: '#/components/schemas/LandCoverDTO'
+    LandCoverDTO:
+      type: object
+      x-validation-source: LandCoverDTO.java
+      description: |
+        GeoJSON Feature for a land cover entry. `properties` map contains: code, name,
+        area (as string), isBpsEligible (as string). `geometry` may be null if
+        `includeGeometries=false`.
+      properties:
+        id:
+          type: number
+          description: Unique land cover identifier
+        type:
+          type: string
+          description: GeoJSON type (always "Feature")
+          example: Feature
+        geometry:
+          description: Null when the request specified `includeGeometries=false`.
+          oneOf:
+            - $ref: '#/components/schemas/GeoJsonGeometry'
+            - type: 'null'
+        properties:
+          type: object
+          description: |
+            Land cover properties map. Keys: code, name, area, isBpsEligible.
+          additionalProperties:
+            type: string
+    GeoJsonGeometry:
+      type: object
+      x-schema-incomplete: true
+      description: |
+        JTS Geometry serialised as GeoJSON. Type may be Polygon, MultiPolygon, Point, etc.
+        Exact structure depends on the parcel geometry stored in LMS.
+      properties:
+        type:
+          type: string
+          example: Polygon
+        coordinates:
+          type: array
+          description: GeoJSON coordinate array (structure depends on type)
+          items: {}
+    AreaInfo:
+      type: object
+      x-validation-source: EligibleLandCoversInfo.AreaInfo (nested class)
+      description: Land cover area breakdown entry.
+      properties:
+        code:
+          type: string
+          description: Land cover classification code
+        name:
+          type: string
+          description: Land cover type name
+        area:
+          type: number
+          description: Area of this land cover type (in hectares)

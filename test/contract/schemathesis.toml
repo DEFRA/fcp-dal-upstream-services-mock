@@ -1,0 +1,121 @@
+# Schemathesis configuration for the contract tests.
+# Isolates check exclusions to specific endpoints, rather than disabling them schema-wide.
+
+# Checks referenced below:
+#   negative_data_rejection  - sends schema-INVALID data and expects the API to reject it (4xx)
+#   positive_data_acceptance - sends schema-VALID data and expects the API to accept it (non-4xx)
+
+# ======================= START OF =======================
+# ==================== Search endpoints ==================
+
+[[operations]]
+include-path = "/organisation/search"
+include-method = "POST"
+
+# Skip: upstream accepts invalid search phrases.
+# e.g. searchFieldType "SBI" with primarySearchPhrase "123" is invalid (needs >=9 chars) but 200s.
+[operations.checks.negative_data_rejection]
+enabled = false
+
+[[operations]]
+include-path = "/person/search"
+include-method = "POST"
+
+# Skip: upstream accepts invalid search phrases
+# e.g. searchFieldType "CUSTOMER_REFERENCE" with a phrase shorter than the 10-digit CRN still 200s.
+[operations.checks.negative_data_rejection]
+enabled = false
+
+# ======================= END OF =======================
+# =================== Search endpoints =================
+
+
+
+# ======================= START OF  =======================
+# ================ Bank submit / validate =================
+
+[[operations]]
+include-path = "/bank-change-service/v1/submit"
+include-method = "POST"
+
+# Skip: some invalid payloads are accepted.
+# e.g. account.bank.swiftCode = {} is invalid per schema (string/number/bool/null) but still 200s.
+[operations.checks.negative_data_rejection]
+enabled = false
+
+# Skip: not all valid data is accepted.
+# e.g. an SBI that isn't a known gets 400s ("Organisation not found");
+[operations.checks.positive_data_acceptance]
+enabled = false
+
+[[operations]]
+include-path = "/bank-change-service/v1/validate"
+include-method = "POST"
+
+# Skip: some invalid payloads are accepted.
+# e.g. account.bank.swiftCode = {} is invalid per schema (string/number/bool/null) but still 200s.
+[operations.checks.negative_data_rejection]
+enabled = false
+
+# Skip: not all valid data is accepted.
+# e.g. an SBI that isn't a known gets 400s ("Organisation not found");
+[operations.checks.positive_data_acceptance]
+enabled = false
+
+# ======================= END OF =======================
+# ============== Bank submit / validate ================
+
+
+
+# ======================= START OF =======================
+# ================== Land land-covers ====================
+
+[[operations]]
+include-path = "/lms/organisation/{organisationId}/parcel/sheet-id/{sheetId}/parcel-id/{parcelId}/historic/{historicDate}/land-covers"
+include-method = "GET"
+
+# Skip: upstream never parses organisationId on this endpoint (200 even for values
+# overflowing a Java Long) and ignores junk includeGeometries values/extra query
+# params, so schema-invalid requests are still served.
+[operations.checks.negative_data_rejection]
+enabled = false
+
+# ======================= END OF =======================
+# ================== Land land-covers ==================
+
+
+
+# ======================= START OF =======================
+# ==================== Person update =====================
+
+[[operations]]
+include-path = "/person/{personId}"
+include-method = "PUT"
+
+# Skip: dateOfBirth must be before now, which cannot be expressed in OAS.
+# e.g. dateOfBirth 9999999999998 is valid per schema (integer <= 9999999999999)
+# but 422s because it is in the future.
+[operations.checks.positive_data_acceptance]
+enabled = false
+
+# ======================= END OF =======================
+# ==================== Person update =====================
+
+
+
+# ======================= START OF =======================
+# ================ Person validateEmail ==================
+
+[[operations]]
+include-path = "/person/{email}/validateEmail"
+include-method = "GET"
+
+# Skip: the email path segment is a free string, but upstream rejects some valid values
+# before reaching the service. e.g. an encoded '#' (%23) is decoded and treated as a
+# fragment, truncating the path and giving 400 "Zero length BigInteger"; control chars or
+# an encoded '%' or '/' give 400 "Bad Message".
+[operations.checks.positive_data_acceptance]
+enabled = false
+
+# ======================= END OF =======================
+# ================ Person validateEmail ==================

@@ -1,0 +1,268 @@
+openapi: '3.0.1'
+info:
+  title: CAPD File Validator Service
+  version: v1
+  x-source-repository: capd-file-validator-service
+  description: |
+    AV (anti-virus) scanning proxy for uploaded files. Validates files against the Symantec
+    Protection Engine before they are accepted into the system. Called internally by
+    capd-file-handler-service; not intended for direct use by portal consumers.
+
+    **Upstream consumers**: capd-file-handler-service (sole direct consumer).
+    **Downstream dependencies**: Symantec Protection Engine AV scanning service.
+
+    **Authentication**: No authentication scheme declared. Internal service-to-service only.
+
+    **Validation pipeline** (from `SymantecProtectionEngineValidatorService`):
+    1. Empty check — file.size == 0 → error code 4 (FILE_IS_EMPTY) → HTTP 400
+    2. Size check — file.size > `${file.max-size-bytes}` → error code 2 (FILE_SIZE_LARGER_THAN_ALLOWED) → HTTP 400
+       Configured value (application.yml): `10485760` bytes (10 MB)
+    3. Extension check — extension (lowercased) must be in `${file.extensions.allowed}` → error code 3 (FILE_TYPE_NOT_ALLOWED) → HTTP 400
+       Configured allowed extensions (application.yml): `jpg, jpeg, png, doc, docx, pdf`
+    4. AV scan — file sent to Symantec Protection Engine → SCAN_SUCCESS = pass; otherwise error code 1 (FILE_FAILED_SCAN) → HTTP 400
+
+    **Error codes** (from `FileValidatorService.java` interface):
+    - 1 = FILE_FAILED_SCAN
+    - 2 = FILE_SIZE_LARGER_THAN_ALLOWED
+    - 3 = FILE_TYPE_NOT_ALLOWED
+    - 4 = FILE_IS_EMPTY
+
+    **Response status for single-file endpoint**: HTTP 200 if file is clean; HTTP 400 if
+    any validation fails (including AV scan failure). This design means callers must handle
+    HTTP 400 as a "valid but failed" response, not an error. capd-file-handler-service's
+    `CapdFileValidatorService` explicitly maps 400 → 200 before returning to its callers.
+
+servers:
+  - url: http://localhost:9032
+    description: Local development server (port 9032)
+
+tags:
+  - name: file-validator
+    description: File validation operations
+
+paths:
+  /v1/validate:
+    post:
+      tags:
+        - file-validator
+      summary: Validate a single file through AV scanning
+      operationId: validateFile
+      description: |
+        Validates a single uploaded file. Applies a sequential check pipeline:
+        empty → size → extension → Symantec AV scan.
+
+        The first failing check short-circuits the pipeline and returns immediately without
+        proceeding to subsequent checks.
+
+        **HTTP 200**: File passed all checks. `valid` is computed as `true` (no errors).
+        **HTTP 400**: File failed a validation check. `valid` is computed as `false`.
+                      The `errors` array contains the specific error (code + description).
+        **HTTP 500**: Unexpected error (e.g. Symantec service unreachable, auth failure).
+                      Response includes `valid: false` and an errors entry with code 500.
+
+        **Note on `valid` field**: `valid` is not a stored field but a computed getter
+        (`isValid()` returns `errors == null || errors.isEmpty()`). Jackson serializes
+        this as the `"valid"` JSON key.
+
+        **Source**: `FileValidatorController.java`, `SymantecProtectionEngineValidatorService.java`
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file to validate. Must not be empty, must be ≤ 10 MB, and must have an allowed extension.
+      responses:
+        '200':
+          description: File passed all checks — clean and accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SingleFileResponse'
+              examples:
+                valid:
+                  summary: File is clean
+                  value:
+                    valid: true
+        '400':
+          description: |
+            File failed a validation check. Check `errors[].code` to identify the reason:
+            - Code 4 (FILE_IS_EMPTY): File has zero bytes
+            - Code 2 (FILE_SIZE_LARGER_THAN_ALLOWED): File exceeds 10 MB (10485760 bytes)
+            - Code 3 (FILE_TYPE_NOT_ALLOWED): Extension not in allowed list (jpg, jpeg, png, doc, docx, pdf)
+            - Code 1 (FILE_FAILED_SCAN): Symantec AV scan returned a non-SCAN_SUCCESS result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SingleFileResponse'
+              examples:
+                empty:
+                  summary: File is empty
+                  value:
+                    valid: false
+                    errors:
+                      - code: 4
+                        description: File is empty
+                tooLarge:
+                  summary: File exceeds 10 MB size limit
+                  value:
+                    valid: false
+                    errors:
+                      - code: 2
+                        description: File size is larger than accepted
+                invalidType:
+                  summary: File extension not allowed
+                  value:
+                    valid: false
+                    errors:
+                      - code: 3
+                        description: Invalid file type
+                virusFound:
+                  summary: AV scan detected threat
+                  value:
+                    valid: false
+                    errors:
+                      - code: 1
+                        description: File failed scan
+        '500':
+          description: Unexpected service error (e.g. Symantec Engine unavailable or authentication failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SingleFileResponse'
+              examples:
+                error:
+                  value:
+                    valid: false
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+  /v1/validate/all:
+    post:
+      tags:
+        - file-validator
+      summary: Validate multiple files through AV scanning
+      operationId: validateFiles
+      description: |
+        Validates multiple uploaded files concurrently using `Flux.flatMap`. Each file is
+        validated independently through the same pipeline as `/v1/validate`. The response
+        `validations` map contains one entry per file with the filename as key and a boolean
+        (`true` = clean, `false` = failed) as value.
+
+        **HTTP 200** is always returned when at least one file was processed successfully.
+        Individual file failures are represented in the `validations` map as `false` values,
+        not as HTTP errors. This is different from the single-file endpoint which returns
+        HTTP 400 for failures.
+
+        **HTTP 500**: Unexpected error processing the request as a whole (not per-file
+        failures — those appear as `false` in the map).
+
+        **Source**: `FileValidatorController.java` (validateFiles)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - files
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                  description: List of files to validate. Each file is validated independently.
+      responses:
+        '200':
+          description: |
+            Files validated. `validations` maps each filename to true (clean) or false (failed).
+            Note that false entries in the map are not errors — they indicate that a specific
+            file failed AV validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MultiFileResponse'
+              examples:
+                mixed:
+                  summary: Mixed results
+                  value:
+                    validations:
+                      good-file.pdf: true
+                      virus.exe: false
+                      document.docx: true
+        '500':
+          description: Unexpected service error processing the batch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MultiFileResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+components:
+  schemas:
+    SingleFileResponse:
+      type: object
+      x-validation-source: SingleFileResponse.java, FileValidatorService.java
+      description: |
+        Response for single-file validation. `valid` is a computed field (Jackson serializes
+        the `isValid()` getter) — it returns `true` when the errors list is null or empty,
+        `false` otherwise. Not a stored field in the DTO.
+      properties:
+        valid:
+          type: boolean
+          description: |
+            True if the file passed all validation checks (errors list is empty).
+            False if any check failed. Computed from errors: valid = (errors == null || errors.isEmpty()).
+        errors:
+          type: array
+          description: |
+            Populated when validation fails. Single entry per response. Known error codes:
+            1=FILE_FAILED_SCAN, 2=FILE_SIZE_LARGER_THAN_ALLOWED, 3=FILE_TYPE_NOT_ALLOWED,
+            4=FILE_IS_EMPTY, 500=unexpected service error.
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    MultiFileResponse:
+      type: object
+      x-validation-source: MultiFileResponse.java
+      description: Response for multi-file validation.
+      properties:
+        validations:
+          type: object
+          description: |
+            Map of filename → boolean. true = file is clean; false = file failed AV scan
+            or other validation check. Always HTTP 200 regardless of individual file results.
+          additionalProperties:
+            type: boolean
+        errors:
+          type: array
+          description: Populated only on HTTP 500 (unexpected service-level failure, not per-file failures).
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    ResponseError:
+      type: object
+      x-validation-source: ResponseError.java
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: |
+            Error code. Known values: 1=FILE_FAILED_SCAN, 2=FILE_SIZE_LARGER_THAN_ALLOWED,
+            3=FILE_TYPE_NOT_ALLOWED, 4=FILE_IS_EMPTY, 500=unexpected service error.
+        description:
+          type: string
+          description: Human-readable error description.

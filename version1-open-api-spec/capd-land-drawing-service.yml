@@ -1,0 +1,1081 @@
+openapi: '3.0.1'
+info:
+  title: CAPD Land Drawing Service
+  version: v1
+  x-source-repository: capd-land-drawing-service
+  description: |
+    Manages land parcel drawing drafts and land cover configuration for the Rural Payments
+    portal. Implemented as a Dropwizard/Jersey service (JAX-RS). Provides CRUD operations
+    for land drawing drafts keyed by (osSheetId, parcelId), and manages parcel status tracking
+    per organisation.
+
+    **Upstream consumers**: Portal front-end map drawing tools, internal GIS tooling.
+    **Downstream dependencies**: CAPD_LAND_DRAWING Oracle database schema (LAND_DRAFT,
+    DIGITISATION_JOB, PARCEL_STATUS tables).
+
+    **Authentication**: No authentication scheme declared in this service.
+
+    **Response envelope**: All responses are wrapped in a `CapdResponse` envelope with a
+    `_data` field. Paginated responses use `CapdPageResponse` with a `_data` and `_page`
+    field. Individual resource endpoints return HTTP 500 with an `ErrorMessage` on failure
+    (Dropwizard error handling).
+
+    **LandDraftRequest validation** (from `LandDraftRequestValidatorImpl`):
+    - Validation passes if `landCovers` is null (not provided) or empty
+    - If `landCovers` is provided and non-empty, each `LandCoverEntry` is validated:
+      - `code` must be non-null and non-blank
+      - `area` must be non-null and > 0
+      - `effectiveDate` (if provided) must be between the configured start effective date
+        and today+1 year (from `LandCoverEntryValidatorImpl`)
+    - If any entry fails validation, the request is rejected (HTTP 400 from Jersey)
+
+    **DraftStatus state machine**:
+    - ACTIVE: draft is in-progress (set automatically on create)
+    - SUBMITTED: draft has been submitted
+    - CANCELLED: draft was cancelled
+
+    **Database**: CAPD_LAND_DRAWING schema. LAND_DRAFT table uses sequence
+    `capd_land_draft_sequence`. Draft content (land cover entries) stored as serialized
+    CLOB in STORED_DATA column.
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: land-cover
+    description: Land cover type reference data
+  - name: land-draft
+    description: Land drawing draft management
+  - name: status
+    description: Service health check
+
+paths:
+  /land-drawing/land-cover/all:
+    get:
+      tags:
+        - land-cover
+      summary: Get all available land cover types
+      operationId: getAll
+      description: |
+        Returns all land cover type configuration records from the CAPD_LAND_DRAWING
+        database. Used by the portal drawing tools to populate land cover type selectors.
+
+        **Source**: `LandCoverResourceImpl.java`, `LandCoverConfigDao.java`
+      responses:
+        '200':
+          description: All land cover types
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseLandCoverTypes'
+              examples:
+                types:
+                  value:
+                    _data:
+                      - code: PG01
+                        description: Permanent Grassland
+                        drawingTools: polygon
+                        measurementType: AREA
+                        measurementUnit: ha
+                        affectsParcelSize: true
+                      - code: AR01
+                        description: Arable
+                        drawingTools: polygon
+                        measurementType: AREA
+                        measurementUnit: ha
+                        affectsParcelSize: false
+
+  /land-drawing/land-draft/{organisationId}/{osSheetId}/{parcelId}:
+    get:
+      tags:
+        - land-draft
+      summary: Get active or latest draft for a parcel
+      operationId: getLandDraft
+      description: |
+        Returns the land draft for a given parcel. If `draftStatus` is ACTIVE or absent,
+        finds the active draft via named query `findActive`. For other statuses, returns
+        the most recently updated draft with that status (ordered by `updatedAt DESC`).
+
+        **HTTP 200**: Draft found.
+        **HTTP 404**: Draft not found (`LandDraftNotFoundException` → `handleDraftNotFound()` →
+        `WebApplicationException` with `Response.Status.NOT_FOUND` and plain text body).
+
+        **Note**: `organisationId` is declared in the path but the GET implementation
+        does NOT filter by organisationId — it queries by (osSheetId, parcelId) only.
+
+        **Source**: `LandDraftResourceImpl.java` (getLandDraftImpl)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user (BigInteger).
+          schema:
+            type: integer
+        - name: organisationId
+          in: path
+          required: true
+          description: Organisation identifier (BigInteger). Required in path but not used in GET query.
+          schema:
+            type: integer
+        - name: osSheetId
+          in: path
+          required: true
+          description: OS map sheet identifier.
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Parcel identifier.
+          schema:
+            type: string
+        - name: draftStatus
+          in: query
+          required: false
+          description: |
+            Filter by draft status. If ACTIVE or absent, returns the current active draft.
+            For SUBMITTED or CANCELLED, returns the most recent draft with that status.
+          schema:
+            type: string
+            enum:
+              - ACTIVE
+              - SUBMITTED
+              - CANCELLED
+      responses:
+        '200':
+          description: Land draft found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseLandDraft'
+        '404':
+          description: |
+            Draft not found for the given (osSheetId, parcelId) and draftStatus.
+            Response body is plain text (not JSON).
+          content:
+            text/plain:
+              schema:
+                type: string
+        '500':
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+    post:
+      tags:
+        - land-draft
+      summary: Create a new land draft for a parcel
+      operationId: createLandDraft
+      description: |
+        Creates a new land draft record in LAND_DRAFT. The draft is always created with
+        status ACTIVE (regardless of any `status` field in the request body). The `callerId`
+        header is set as `updatedByUser`. `createdAt` and `updatedAt` are set to the current
+        timestamp.
+
+        **Validation** (from `LandDraftRequestValidatorImpl`):
+        - If `landCovers` is provided and non-empty, each entry requires: non-blank `code`,
+          positive `area`, and `effectiveDate` (if present) within the allowed range
+          (configured start date → now+1 year). Validation failure returns HTTP 400.
+
+        **HTTP 200**: Draft created.
+        **HTTP 400**: Land cover entry validation failed. The error message is generic:
+        `"Validation of land draft request failed"` (no field-level detail is returned).
+        **HTTP 409**: A draft already exists for this (osSheetId, parcelId) combination.
+        Triggered by `LandDraftUniquenessExceptionMapper` when the `FN_UNIQUE_IDX_DRAFT`
+        database constraint is violated.
+        **HTTP 422**: A database constraint OTHER than uniqueness is violated (also from
+        `LandDraftUniquenessExceptionMapper` — any `ConstraintViolationException` without
+        `FN_UNIQUE_IDX_DRAFT` in the constraint name).
+
+        **Note**: The class `LandDraftAlreadyExistsException` exists in the codebase but
+        is never thrown or caught by the exception mapper. The actual mapping is done by
+        `LandDraftUniquenessExceptionMapper` which catches Hibernate
+        `ConstraintViolationException`.
+
+        **effectiveDate null handling**: A null `effectiveDate` in a land cover entry
+        passes validation (null short-circuits to valid in `LandCoverEntryValidatorImpl`).
+
+        **Source**: `LandDraftResourceImpl.java` (createLandDraftImpl)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user. Set as `updatedByUser` on the created draft.
+          schema:
+            type: integer
+        - name: organisationId
+          in: path
+          required: true
+          description: Organisation identifier. Stored in ORGANISATION_ID column.
+          schema:
+            type: integer
+        - name: osSheetId
+          in: path
+          required: true
+          description: OS map sheet identifier. Part of the composite parcel key.
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Parcel identifier. Part of the composite parcel key.
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LandDraftRequest'
+      responses:
+        '200':
+          description: Draft created with status ACTIVE
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseLandDraft'
+        '400':
+          description: |
+            Land cover entry validation failed. Returns generic message:
+            `"Validation of land draft request failed"` (no per-field detail).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+        '409':
+          description: |
+            A draft already exists for this (osSheetId, parcelId). Triggered by
+            `FN_UNIQUE_IDX_DRAFT` unique constraint violation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+        '422':
+          description: |
+            Database constraint violation other than uniqueness (from
+            `LandDraftUniquenessExceptionMapper` — any `ConstraintViolationException`
+            without `FN_UNIQUE_IDX_DRAFT` in the constraint name).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+        '500':
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+    put:
+      tags:
+        - land-draft
+      summary: Update an existing land draft
+      operationId: updateLandDraft
+      description: |
+        Updates an existing land draft by (osSheetId, parcelId). Replaces the stored
+        land cover entries (STORED_DATA) with the new serialized content. Updates
+        `updatedByUser` to `callerId` and `updatedAt` to current timestamp.
+
+        **Validation** (from `LandDraftRequestValidatorImpl`): Same as POST — each
+        land cover entry requires non-blank `code`, positive `area`, and valid
+        `effectiveDate` (if present). Validation failure returns HTTP 400.
+
+        **HTTP 200**: Draft updated.
+        **HTTP 404**: Draft not found (`LandDraftNotFoundException` → `handleDraftNotFound()`
+        → plain text body, NOT JSON).
+
+        **Source**: `LandDraftResourceImpl.java` (updateLandDraftImpl)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user. Set as `updatedByUser` on the updated draft.
+          schema:
+            type: integer
+        - name: organisationId
+          in: path
+          required: true
+          description: Organisation identifier.
+          schema:
+            type: integer
+        - name: osSheetId
+          in: path
+          required: true
+          description: OS map sheet identifier.
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Parcel identifier.
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LandDraftRequest'
+      responses:
+        '200':
+          description: Draft updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseLandDraft'
+        '400':
+          description: |
+            Land cover entry validation failed. Returns generic message:
+            `"Validation of land draft request failed"` (no per-field detail).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+        '404':
+          description: |
+            Draft not found for the given (osSheetId, parcelId). Response body is
+            plain text (not JSON).
+          content:
+            text/plain:
+              schema:
+                type: string
+        '500':
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+  /land-drawing/land-draft/{organisationId}/{osSheetId}/{parcelId}/{draftStatus}:
+    put:
+      tags:
+        - land-draft
+      summary: Update draft status by parcel reference
+      operationId: updateLandDraftStatus
+      description: |
+        Updates the `status` of the active land draft for a given (osSheetId, parcelId)
+        combination. Sets `updatedAt` to current timestamp and `updatedByUser` to
+        `callerId`. Does NOT validate the transition (any status can be set).
+
+        **HTTP 200**: Status updated.
+        **HTTP 404**: Draft not found (`LandDraftNotFoundException` → plain text body).
+
+        **Note on state transitions**: No state machine validation is enforced. Any
+        status can be set regardless of the current status (e.g. CANCELLED→ACTIVE is
+        allowed). No concurrency control (no ETag or version field).
+
+        **Source**: `LandDraftResourceImpl.java` (updateLandDraftStatusImpl)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user.
+          schema:
+            type: integer
+        - name: organisationId
+          in: path
+          required: true
+          description: Organisation identifier (in path but not used in the status update query).
+          schema:
+            type: integer
+        - name: osSheetId
+          in: path
+          required: true
+          description: OS map sheet identifier.
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Parcel identifier.
+          schema:
+            type: string
+        - name: draftStatus
+          in: path
+          required: true
+          description: New status to apply.
+          schema:
+            type: string
+            enum:
+              - ACTIVE
+              - SUBMITTED
+              - CANCELLED
+      responses:
+        '200':
+          description: Draft status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseLandDraft'
+        '404':
+          description: |
+            Draft not found for the given (osSheetId, parcelId). Response body is
+            plain text (not JSON).
+          content:
+            text/plain:
+              schema:
+                type: string
+        '500':
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+  /land-drawing/land-draft/{organisationId}/{osSheetId}/{parcelId}/status/{parcelStatus}:
+    put:
+      tags:
+        - land-draft
+      summary: Update parcel checked/unchecked status for an organisation
+      operationId: updateParcelStatus
+      description: |
+        Creates or updates the PARCEL_STATUS record for the given
+        (organisationId, osSheetId, parcelId) triple. Sets the `checked` flag to the
+        provided boolean value and `updatedAt` to the current timestamp. This is an
+        upsert operation — if no record exists, one is created.
+
+        **Source**: `LandDraftResourceImpl.java` (updateParcelStatusImpl),
+        `ParcelStatusDao.java` (createOrUpdateParcelStatus)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user.
+          schema:
+            type: integer
+        - name: organisationId
+          in: path
+          required: true
+          description: Organisation identifier.
+          schema:
+            type: integer
+        - name: osSheetId
+          in: path
+          required: true
+          description: OS map sheet identifier.
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Parcel identifier.
+          schema:
+            type: string
+        - name: parcelStatus
+          in: path
+          required: true
+          description: |
+            Boolean checked/unchecked value. `true` = checked; `false` = unchecked.
+            Upserts the PARCEL_STATUS record.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Parcel status upserted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseParcelStatus'
+        '500':
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+  /land-drawing/land-draft/{organisationId}/{osSheetId}/{parcelId}/verified:
+    post:
+      tags:
+        - land-draft
+      summary: Mark a land draft as verified
+      operationId: markAsVerified
+      description: |
+        Sets the `IS_VERIFIED` flag on the active land draft for a given
+        (osSheetId, parcelId). Used after internal review to mark a draft as verified.
+        Returns an empty HTTP 200 on success.
+
+        **Source**: `LandDraftResourceImpl.java` (markAsVerifiedImpl),
+        `LandDraftService.java` (markAsVerified)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user.
+          schema:
+            type: integer
+        - name: organisationId
+          in: path
+          required: true
+          description: Organisation identifier.
+          schema:
+            type: integer
+        - name: osSheetId
+          in: path
+          required: true
+          description: OS map sheet identifier.
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Parcel identifier.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Draft marked as verified. Response body is empty.
+        '404':
+          description: |
+            Draft not found for the given (osSheetId, parcelId). Response body is
+            plain text (not JSON).
+          content:
+            text/plain:
+              schema:
+                type: string
+        '500':
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+  /land-drawing/land-draft/{organisationId}/list:
+    get:
+      tags:
+        - land-draft
+      summary: List parcel statuses for an organisation
+      operationId: getLandDraftsList
+      description: |
+        Returns all PARCEL_STATUS records for the given `organisationId`. For each
+        parcel, checks if an active draft exists — if it does, the `checked` flag
+        is set to `false` in the response (overriding the stored value). Used by the
+        portal to determine which parcels are available for drawing.
+
+        **Source**: `LandDraftResourceImpl.java` (getLandDraftsListImpl),
+        `ParcelStatusDao.java` (findParcelStatusList)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user.
+          schema:
+            type: integer
+        - name: organisationId
+          in: path
+          required: true
+          description: Organisation identifier to list parcel statuses for.
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List of parcel statuses for the organisation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseParcelStatusList'
+        '500':
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+  /land-drawing/land-draft/internal/{osSheetId}/{parcelId}:
+    get:
+      tags:
+        - land-draft
+      summary: Internal — list parcel drafts by status with pagination
+      operationId: getParcelDraftsByStatus
+      description: |
+        Internal endpoint. Returns a paginated list of land drafts for a specific
+        (osSheetId, parcelId) combination, filtered by status. Results are ordered
+        by `updatedAt ASC`.
+
+        **Pagination defaults**: `offset=0`, `limit=20` if not provided.
+
+        **Source**: `LandDraftResourceImpl.java` (getParcelDraftsByStatusImpl),
+        `LandDraftService.java` (getParcelDraftsByStatusSortedByModificationDate)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user.
+          schema:
+            type: integer
+        - name: osSheetId
+          in: path
+          required: true
+          description: OS map sheet identifier.
+          schema:
+            type: string
+        - name: parcelId
+          in: path
+          required: true
+          description: Parcel identifier.
+          schema:
+            type: string
+        - name: draftStatus
+          in: query
+          required: false
+          description: Filter results by draft status. Defaults to all statuses if not provided.
+          schema:
+            type: string
+            enum:
+              - ACTIVE
+              - SUBMITTED
+              - CANCELLED
+        - name: offset
+          in: query
+          required: false
+          description: Pagination offset. Default 0.
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          description: Pagination limit. Default 20.
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Paginated list of land drafts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdPageResponseLandDrafts'
+        '500':
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+  /land-drawing/land-draft/internal/parcels-ids:
+    get:
+      tags:
+        - land-draft
+      summary: Internal — list all distinct parcel identifiers with pagination
+      operationId: getParcelIdentifiers
+      description: |
+        Internal endpoint. Returns a paginated list of all distinct parcel identifiers
+        (osSheetId + parcelId) that have at least one draft record. Results are ordered
+        by osSheetId ASC, parcelId ASC.
+
+        **Pagination defaults**: `offset=0`, `limit=20` if not provided.
+
+        **Source**: `LandDraftResourceImpl.java` (getParcelIdentifiersImpl),
+        `LandDraftService.java` (getParcelIdentifiers, countParcelIdentifiers)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user.
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          required: false
+          description: Pagination offset. Default 0.
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          description: Pagination limit. Default 20.
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Paginated list of distinct parcel identifiers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdPageResponseParcelIdentifiers'
+        '500':
+          description: Unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+  /land-drawing/land-draft/internal/{draftId}:
+    put:
+      tags:
+        - land-draft
+      summary: Internal — update draft content by database ID
+      operationId: updateLandDraftContentById
+      description: |
+        Internal endpoint. Looks up a draft by its database `ID` and replaces the
+        land cover entries (STORED_DATA). Does NOT update metadata fields
+        (`createdAt`, `updatedAt`, `updatedByUser`) — all metadata is preserved from
+        the existing record. Only STORED_DATA is modified.
+
+        This endpoint is intended for internal tooling corrections only.
+
+        **HTTP 200**: Draft updated.
+        **HTTP 500**: Draft not found.
+
+        **Source**: `LandDraftResourceImpl.java` (updateLandDraftContentByIdImpl)
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: Identifier of the calling user.
+          schema:
+            type: integer
+        - name: draftId
+          in: path
+          required: true
+          description: Database row ID of the land draft (from capd_land_draft_sequence).
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LandDraftRequest'
+      responses:
+        '200':
+          description: Draft content updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapdResponseLandDraft'
+        '400':
+          description: Land cover entry validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+        '500':
+          description: Draft not found or unexpected error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application health check
+      operationId: getStatus
+      description: Returns a simple text string indicating the application health state.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+              examples:
+                healthy:
+                  value: 'OK'
+
+components:
+  schemas:
+    LandDraftRequest:
+      type: object
+      x-validation-source: LandDraftRequestValidatorImpl.java, LandCoverEntryValidatorImpl.java
+      description: |
+        Request body for creating or updating a land draft. `landCovers` is the main
+        payload — the list of land cover features for the parcel. `jobs` tracks
+        digitisation jobs linked to the draft.
+
+        **Validation** (only applies if `landCovers` is non-null and non-empty):
+        - Each LandCoverEntry must have non-blank `code`, positive `area`, and
+          `effectiveDate` (if provided) between the configured start date and now+1 year.
+        - `status` in request body is ignored on create (always set to ACTIVE).
+      properties:
+        processed:
+          type: boolean
+          description: Whether the draft has been processed. Stored as IS_PROCESSED in DB.
+        verified:
+          type: boolean
+          description: Whether the draft has been verified. Stored as IS_VERIFIED in DB.
+        status:
+          type: string
+          description: |
+            Draft status. Note: ignored on POST create (status is always set to ACTIVE).
+            Can be set via dedicated status update endpoints.
+          enum:
+            - ACTIVE
+            - SUBMITTED
+            - CANCELLED
+        jobs:
+          type: array
+          uniqueItems: true
+          description: Set of digitisation job IDs linked to this draft (stored in DIGITISATION_JOB table).
+          items:
+            $ref: '#/components/schemas/DigitisationJob'
+        landCovers:
+          type: array
+          description: |
+            Land cover feature entries. Serialized to STORED_DATA (CLOB) on save.
+            If null or empty, no validation is applied. If non-empty, each entry is validated.
+          items:
+            $ref: '#/components/schemas/LandCoverEntry'
+
+    LandCoverEntry:
+      type: object
+      x-validation-source: LandCoverEntryValidatorImpl.java
+      description: |
+        A single land cover feature. When submitting via create or update endpoints,
+        each entry is validated: `code` required, `area` must be > 0, `effectiveDate`
+        must be within [configured start date, now+1 year] if provided.
+      properties:
+        code:
+          type: string
+          description: Land cover type code. Required — must be non-null and non-blank.
+          example: PG01
+        description:
+          type: string
+          description: Human-readable land cover type description.
+        drawingTools:
+          type: string
+          description: Drawing tool configuration string.
+        area:
+          type: number
+          description: Feature area. Required — must be > 0.
+          example: 2.45
+        effectiveDate:
+          type: string
+          format: date-time
+          description: |
+            Effective date for this land cover entry. Optional, but if present must be
+            between the configured start effective date and today+1 year. ISO 8601 format.
+        center:
+          $ref: '#/components/schemas/Point'
+        measurements:
+          type: string
+          description: Serialized measurements data.
+        geometry:
+          type: string
+          description: Serialized geometry (GeoJSON or WKT string).
+        landCoverId:
+          type: integer
+          format: int32
+          description: Reference to the land cover configuration record.
+        note:
+          type: string
+          description: Freeform note about this feature.
+        featureWidth:
+          type: number
+          description: Feature width (for linear features).
+        featureLength:
+          type: number
+          description: Feature length (for linear features).
+
+    Point:
+      type: object
+      x-validation-source: Point.java (domain)
+      description: A 2D coordinate point representing the center of a land cover feature.
+      properties:
+        x:
+          type: number
+          format: double
+          description: Longitude / easting.
+        'y':
+          type: number
+          format: double
+          description: Latitude / northing.
+
+    DigitisationJob:
+      type: object
+      x-validation-source: DigitisationJob.java (domain)
+      description: A digitisation job reference linked to a draft (stored in DIGITISATION_JOB table).
+      properties:
+        jobId:
+          type: string
+          description: Unique job identifier.
+
+    LandCoverType:
+      type: object
+      x-validation-source: LandCoverType.java (model), LandCoverConfig.java (domain)
+      description: A land cover type configuration record.
+      properties:
+        code:
+          type: string
+          description: Land cover type code.
+        description:
+          type: string
+          description: Human-readable land cover type name.
+        drawingTools:
+          type: string
+          description: Drawing tools configuration string.
+        measurementType:
+          type: string
+          description: Measurement type (e.g. AREA, LENGTH).
+        measurementUnit:
+          type: string
+          description: Measurement unit (e.g. ha, m).
+        affectsParcelSize:
+          type: boolean
+          description: Whether this land cover type affects the parcel's calculated area.
+
+    LandDraftResponse:
+      type: object
+      x-schema-incomplete: true
+      description: |
+        Response DTO for a land draft, as returned by `transformLandDraft()`. Mirrors
+        the fields of `LandDraft` domain entity. Exact field names depend on `LandDrawingMapper`
+        implementation.
+      properties:
+        id:
+          type: integer
+          description: Database row ID.
+        parcelId:
+          type: string
+        osSheetId:
+          type: string
+        status:
+          type: string
+          enum:
+            - ACTIVE
+            - SUBMITTED
+            - CANCELLED
+        organisationId:
+          type: integer
+        processed:
+          type: boolean
+        verified:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        updatedByUser:
+          type: integer
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/DigitisationJob'
+        landCovers:
+          type: array
+          items:
+            $ref: '#/components/schemas/LandCoverEntry'
+
+    ParcelStatusDto:
+      type: object
+      x-schema-incomplete: true
+      description: Parcel status record as returned by `transformParcelStatus()`.
+      properties:
+        osSheetId:
+          type: string
+        parcelId:
+          type: string
+        organisationId:
+          type: integer
+        checked:
+          type: boolean
+          description: |
+            True if the parcel has been checked. Note: in getLandDraftsList, `checked`
+            is overridden to `false` if an active draft exists for the parcel.
+        updatedAt:
+          type: string
+          format: date-time
+
+    ParcelIdentifierDto:
+      type: object
+      description: A distinct parcel identifier (osSheetId + parcelId).
+      properties:
+        osSheetId:
+          type: string
+        parcelId:
+          type: string
+
+    Page:
+      type: object
+      description: Pagination metadata included in `_page` of paginated responses.
+      properties:
+        totalElements:
+          type: integer
+          description: Total number of records in the result set.
+        numberOfElements:
+          type: integer
+          description: Number of records in the current page.
+        size:
+          type: integer
+          description: Page size (equals numberOfElements in this implementation).
+        number:
+          type: integer
+          description: Current page number (1-based, calculated as offset/limit + 1).
+        totalPages:
+          type: integer
+          description: Total number of pages.
+
+    CapdResponseLandCoverTypes:
+      type: object
+      description: CapdResponse envelope wrapping a list of LandCoverType
+      properties:
+        _data:
+          type: array
+          items:
+            $ref: '#/components/schemas/LandCoverType'
+
+    CapdResponseLandDraft:
+      type: object
+      description: CapdResponse envelope wrapping a single LandDraftResponse
+      properties:
+        _data:
+          $ref: '#/components/schemas/LandDraftResponse'
+
+    CapdResponseParcelStatus:
+      type: object
+      description: CapdResponse envelope wrapping a single ParcelStatusDto
+      properties:
+        _data:
+          $ref: '#/components/schemas/ParcelStatusDto'
+
+    CapdResponseParcelStatusList:
+      type: object
+      description: CapdResponse envelope wrapping a list of ParcelStatusDto
+      properties:
+        _data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParcelStatusDto'
+
+    CapdPageResponseLandDrafts:
+      type: object
+      description: Paginated CapdResponse envelope wrapping a list of LandDraftResponse
+      properties:
+        _data:
+          type: array
+          items:
+            $ref: '#/components/schemas/LandDraftResponse'
+        _page:
+          $ref: '#/components/schemas/Page'
+
+    CapdPageResponseParcelIdentifiers:
+      type: object
+      description: Paginated CapdResponse envelope wrapping a list of ParcelIdentifierDto
+      properties:
+        _data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParcelIdentifierDto'
+        _page:
+          $ref: '#/components/schemas/Page'
+
+    ErrorMessage:
+      type: object
+      description: Dropwizard error envelope returned on HTTP 4xx/5xx
+      properties:
+        code:
+          type: integer
+          description: HTTP status code
+        message:
+          type: string
+          description: Human-readable error description

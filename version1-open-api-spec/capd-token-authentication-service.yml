@@ -1,0 +1,241 @@
+openapi: '3.0.1'
+info:
+  title: CAPD Token Authentication Service
+  version: v1
+  x-source-repository: capd-token-authentication-service
+  description: |
+    Dropwizard/Jersey service acting as a gateway identity resolver. Accepts a user
+    identifier (CRN for external users, email for internal users), queries the CAPD
+    Oracle database, and returns the resolved identity (personId, callerId, userType)
+    as HTTP **response headers** — the response body is always empty (null).
+
+    **Purpose**: Called by the API Gateway to resolve an authenticated user's internal
+    CAPD identity before forwarding requests downstream. This service bridges the
+    external authentication world (CRN / email) to the internal CAPD identity
+    (personId, callerId, userType).
+
+    **Note**: The external endpoint method is named `thisMethodShouldntExist` in source
+    code, indicating it may be legacy/deprecated. Both endpoints remain active.
+
+    **Downstream dependencies**:
+    - `CAPD.PERSON` table (external lookups by `CUSTOMER_REFERENCE`)
+    - `CAPD.PARTY_DIGITAL_CONTACT` table (internal lookups by `DIGITAL_ADDRESS`)
+
+    **Response pattern**: On HTTP 200, all identity information is returned as response
+    headers. The response body is empty (`entity(null)`). On HTTP 404, only the
+    `cap-request-id` echo header is returned (no body).
+
+    **`cap-request-id` header**: The incoming `cap-request-id` request header is read
+    and echoed back on all responses (200 and 404) via the `cap-request-id` response
+    header. **If the request header is absent, the response header will contain the
+    literal string `"null"` — not omitted.** Consumers should not assume the echoed
+    value is a valid trace identifier.
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: authentication_request
+    description: Gateway authentication identity resolution
+
+paths:
+  /authentication_request/pseudoAuth/{crn}:
+    get:
+      tags:
+        - authentication_request
+      summary: Resolve external user identity by CRN
+      operationId: thisMethodShouldntExist
+      description: |
+        Resolves an external CAPD user identity from their Customer Reference Number (CRN).
+        Used by the API Gateway to exchange a CRN (provided by the external IdP) for internal
+        CAPD identity fields.
+
+        **Lookup**: Queries `CAPD.PERSON` table where `CUSTOMER_REFERENCE = crn`. Returns
+        the first matching row (`.uniqueResult()`).
+
+        **On HTTP 200** (match found):
+        - Response body is **empty** (`null`).
+        - Response headers contain the resolved identity:
+          - `personId`: value of `PERSON.ID` as string
+          - `callerId`: value of `PERSON.ID` as string (same as personId)
+          - `userType`: always `"external"`
+          - `cap-request-id`: echoed from request header
+
+        **On HTTP 404** (no match, or any exception):
+        - Response body is empty.
+        - `cap-request-id` echo header is returned.
+        - All exceptions are caught and treated as 404 (no distinction between DB errors
+          and not-found).
+
+        **Validation**: No input validation — CRN is passed directly to the HQL query.
+        SQL injection is not possible due to parameterised HQL (`setParameter`).
+        No length, format, or character constraints are applied.
+
+        **Response header null safety**: If the resolved `GatewayDetailsResponse` fields
+        (personId, callerId) are null in the database, the response headers will contain
+        the literal string `"null"` rather than being omitted.
+      parameters:
+        - name: crn
+          in: path
+          required: true
+          description: |
+            Customer Reference Number — the external user's CAPD CRN. Looked up in
+            `CAPD.PERSON.CUSTOMER_REFERENCE`.
+          schema:
+            type: string
+        - name: cap-request-id
+          in: header
+          required: false
+          description: |
+            Request trace identifier supplied by the API Gateway. Echoed back in the
+            response `cap-request-id` header regardless of outcome.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: |
+            External user identity resolved successfully. Response body is empty.
+            Identity is returned in response headers.
+          headers:
+            personId:
+              description: Resolved internal CAPD person ID (value of PERSON.ID as string)
+              schema:
+                type: string
+            callerId:
+              description: Resolved CAPD caller ID (same as personId for external users)
+              schema:
+                type: string
+            userType:
+              description: User type classification — always "external" for this endpoint
+              schema:
+                type: string
+                enum:
+                  - external
+            cap-request-id:
+              description: Echoed request trace identifier
+              schema:
+                type: string
+        '404':
+          description: |
+            No record found for the given CRN, or any exception occurred during lookup.
+            All exceptions are caught and treated as 404. Response body is empty.
+          headers:
+            cap-request-id:
+              description: Echoed request trace identifier
+              schema:
+                type: string
+
+  /authentication_request/pseudoAuthInternal/{email}:
+    get:
+      tags:
+        - authentication_request
+      summary: Resolve internal user identity by email address
+      operationId: pseudoAuthInternal
+      description: |
+        Resolves an internal CAPD user identity from their email address. Used by the API
+        Gateway to exchange a corporate email (from the internal IdP) for internal CAPD
+        identity fields.
+
+        **Lookup**: Queries `CAPD.PARTY_DIGITAL_CONTACT` table by `DIGITAL_ADDRESS = email`
+        via `PartyDigitalContactRepository.findByEmail(email)`.
+
+        **On HTTP 200** (match found):
+        - Response body is **empty** (`null`).
+        - Response headers contain the resolved identity:
+          - `personId`: value of `PARTY_DIGITAL_CONTACT.PARTY_ID` as string
+          - `callerId`: value of `PARTY_DIGITAL_CONTACT.PARTY_ID` as string (same as personId)
+          - `userType`: always `"internal"`
+          - `cap-request-id`: echoed from request header
+
+        **On HTTP 404** (no match):
+        - `ElementNotFoundException` thrown (`orElseThrow`). Caught by outer catch.
+        - Response body is empty.
+        - `cap-request-id` echo header returned.
+
+        **Validation**: No input validation — email is passed directly to the repository
+        query. SQL injection is not possible due to parameterised queries.
+        **Important**: Despite the `format: email` declaration below, no email format
+        validation is applied in the service code. Any string will be accepted and used
+        as a database lookup key. The `format: email` annotation is informational only.
+
+        **Response header null safety**: If the resolved identity fields are null in the
+        database, the response headers will contain the literal string `"null"` rather
+        than being omitted.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: |
+            Corporate email address of the internal user. Looked up in
+            `CAPD.PARTY_DIGITAL_CONTACT.DIGITAL_ADDRESS`.
+          schema:
+            type: string
+            format: email
+        - name: cap-request-id
+          in: header
+          required: false
+          description: |
+            Request trace identifier supplied by the API Gateway. Echoed back in the
+            response `cap-request-id` header regardless of outcome.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: |
+            Internal user identity resolved successfully. Response body is empty.
+            Identity is returned in response headers.
+          headers:
+            personId:
+              description: Resolved internal CAPD person ID (PARTY_DIGITAL_CONTACT.PARTY_ID as string)
+              schema:
+                type: string
+            callerId:
+              description: Resolved CAPD caller ID (same as personId for internal users)
+              schema:
+                type: string
+            userType:
+              description: User type classification — always "internal" for this endpoint
+              schema:
+                type: string
+                enum:
+                  - internal
+            cap-request-id:
+              description: Echoed request trace identifier
+              schema:
+                type: string
+        '404':
+          description: |
+            No PARTY_DIGITAL_CONTACT record found with the given email address.
+            Response body is empty.
+          headers:
+            cap-request-id:
+              description: Echoed request trace identifier
+              schema:
+                type: string
+
+components:
+  schemas:
+    GatewayDetailsResponse:
+      type: object
+      x-validation-source: GatewayDetailsResponse.java (internal DTO — NOT returned as HTTP body)
+      description: |
+        Internal DTO used to carry resolved identity within the service. NOT serialised to
+        HTTP response body. Identity fields are extracted into HTTP response headers by the
+        resource class. See endpoint descriptions for header names.
+      properties:
+        callerId:
+          type: string
+          description: |
+            The resolved internal CAPD caller ID. Set to `String.valueOf(PERSON.ID)` for
+            external users, or `String.valueOf(PARTY_DIGITAL_CONTACT.PARTY_ID)` for internal users.
+        personId:
+          type: string
+          description: |
+            The resolved CAPD person ID. Set to the same value as callerId in both paths.
+        userType:
+          type: string
+          description: User type. Always "external" for pseudoAuth, "internal" for pseudoAuthInternal.
+          enum:
+            - external
+            - internal

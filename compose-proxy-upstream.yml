@@ -1,0 +1,27 @@
+services:
+  # Starts the DAL, with upstream/server MTLS configuration.  This is primarily intended to act as the upstream
+  # endpoint for the /proxy endpoint in the mock.
+  mtls-protected-upstream-simulator:
+    build:
+      context: .
+    environment:
+      MOCK_LOG_LEVEL: info
+      NODE_ENV: production
+      PORT: 3101
+      TLS_KEY: ${KITS_MOCK_TLS_SERVER_KEY:?KITS_MOCK_TLS_SERVER_KEY must be set for kits emulation}
+      TLS_CERT: ${KITS_MOCK_TLS_SERVER_CERT:?KITS_MOCK_TLS_SERVER_CERT must be set for kits emulation}
+      TLS_CA: ${KITS_CA_CERT:?KITS_CA_CERT must be set for kits emulation}
+    ports:
+      - '3101:3101'
+    healthcheck:
+      test: curl -s --cacert /tmp/ca.crt --key /tmp/client.key --cert /tmp/client.crt https://localhost:3101/health > /tmp/start.log 2>&1
+    volumes:
+      - ./scripts/mtls/ca.crt:/tmp/ca.crt:ro
+      - ./scripts/mtls/client.crt:/tmp/client.crt:ro
+      - ./scripts/mtls/client.key:/tmp/client.key:ro
+    networks:
+      - default
+
+networks:
+  default:
+    driver: bridge

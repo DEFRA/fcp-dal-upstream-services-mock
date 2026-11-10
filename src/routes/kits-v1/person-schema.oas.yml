@@ -1,0 +1,1307 @@
+openapi: 3.1.0
+info:
+  title: Person API
+  description: API for person-related operations
+  version: '1.0.0'
+  license:
+    name: 'Open Government Licence v3.0'
+    url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3'
+tags:
+  - name: person
+    description: 'Operations related to person management'
+security:
+  - mTLS: []
+servers:
+  - url: 'https://chs-upgrade-api.ruraldev.org.uk:8446/extapi'
+    description: The test server for KITS/V1 APIs
+paths:
+  /person/create:
+    post:
+      tags:
+        - 'person'
+      summary: 'Creates a new person'
+      description: 'Creates a new person with the provided details'
+      operationId: 'createPerson'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersonalUpdateRequest'
+      responses:
+        '200':
+          description: 'Successfully created a new person. Returns result inside a CapdResponse.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    $ref: '#/components/schemas/PersonCreatedResponse'
+                required:
+                  - '_data'
+                additionalProperties: false
+        '400':
+          description: 'Unable to process JSON.'
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Forbidden - caller not authorised.
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          description: 'Required fields are missing or invalid.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 422
+                  message:
+                    type: string
+                    example: 'HTTP 422'
+  /person/{email}/validateEmail:
+    get:
+      tags:
+        - 'person'
+      summary: 'Validates emails'
+      description: 'Returns a boolean to indicate if the email is duplicated'
+      operationId: 'isEmailDuplicated'
+      parameters:
+        - name: 'email'
+          in: 'path'
+          description: 'email'
+          required: true
+          schema:
+            type: 'string'
+      responses:
+        '200':
+          description: >
+            Successfully returns a flag to indicate if the email is duplicate.
+            Returns result inside CapdResponse
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    type: object
+                    properties:
+                      emailDuplicated:
+                        type: boolean
+                    required:
+                      - 'emailDuplicated'
+                    additionalProperties: false
+                required:
+                  - '_data'
+                additionalProperties: false
+        '400':
+          description: >
+            The request was rejected before reaching the service because the `email` path segment
+            could not be parsed as a URI (e.g. control characters or an encoded `%` or `/`),
+            typically as an HTML "Bad Message 400" page. An encoded `#` (`%23`) is decoded upstream
+            and treated as a fragment, truncating the path so it routes to an endpoint expecting a
+            numeric id, giving a "Zero length BigInteger" 400.
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: A WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          description: 'Error confirming if email is duplicated'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: 'There was an error processing your request.'
+  /person/{personId}/{email}/confirm:
+    get:
+      tags:
+        - 'person'
+      summary: 'Confirms an email'
+      description: >
+        Verifies if the email can be used and marked as validated by the user
+      operationId: 'confirmEmail'
+      parameters:
+        - name: 'personId'
+          in: 'path'
+          description: 'The unique ID of the requested person.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [11111111, 11112222, 22222222]
+        - name: 'email'
+          in: 'path'
+          description: 'email'
+          required: true
+          schema:
+            type: 'string'
+      responses:
+        '200':
+          description: 'PartyDigitalContact model with all data filled in. Returns result inside a CapdResponse'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    $ref: '#/components/schemas/PartyDigitalContact'
+                required:
+                  - '_data'
+                additionalProperties: false
+        '403':
+          description: A WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 'Person does not have any email assigned'
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 'Email address is already verified, either by this person or by another person'
+          $ref: '#/components/responses/Conflict'
+        '500':
+          description: 'Dao exception encountered when retrieving complete person profile'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: 'There was an error processing your request.'
+  /verify-email/{digitalContactPartyId}:
+    post:
+      tags:
+        - 'person'
+      summary: 'Sends a verification email'
+      description: >
+        Sends a verification email to the PartyDigitalContact identified by digitalContactPartyId,
+        as returned by GET /person/{personId}/{email}/confirm
+      operationId: 'verifyEmail'
+      parameters:
+        - name: 'digitalContactPartyId'
+          in: 'path'
+          description: 'The unique ID of the PartyDigitalContact record.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      requestBody:
+        required: true
+        description: 'Email address to send the verification email to, as plain text.'
+        content:
+          text/plain:
+            schema:
+              type: string
+              format: email
+              example: 'person@example.com'
+      responses:
+        '200':
+          description: 'Verification email sent. Returns result inside a CapdResponse'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    type: string
+                required:
+                  - '_data'
+                additionalProperties: false
+        '403':
+          description: A WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          description: 'Error sending email, or no email provided in the request body'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: 'HTTP 500 Internal Server Error'
+  /person/{personId}/summary:
+    get:
+      tags:
+        - 'person'
+      summary: 'Find By Person ID'
+      description: 'Request to get details for a person with a specified ID.'
+      operationId: 'getPersonSummaryById'
+      parameters:
+        - name: 'personId'
+          in: 'path'
+          description: 'The unique ID of the requested person.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [11111111, 11112222, 22222222]
+      responses:
+        '200':
+          description: 'Returns the person details for the specified ID.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    $ref: '#/components/schemas/FullPersonDetails'
+                required:
+                  - '_data'
+                additionalProperties: false
+        '403':
+          description: Getting an internal user's details is forbidden, or a WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 'Person not found'
+          $ref: '#/components/responses/NotFound'
+
+  /person/search:
+    post:
+      tags:
+        - 'person'
+      summary: 'Search for a person'
+      description: >
+        Search for a person by CRN, personal identifier, customer name, customer postcode,
+        vendor number, or trader number.
+      operationId: 'searchPerson'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchRequestBody'
+      responses:
+        '200':
+          description: >
+            Successfully returns list of customer summary. Returns result inside a CapdPageResponse.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PersonSearchResponse'
+                  _page:
+                    $ref: '#/components/schemas/Page'
+                required:
+                  - '_data'
+                  - '_page'
+                additionalProperties: false
+        '400':
+          description: >
+            The `primarySearchPhrase` is shorter than the minimum length for the selected `searchFieldType`,
+            or the `searchFieldType` is not recognised.
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          description: 'Internal server error, or only `searchFieldType` was provided.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: >
+                      There was an error processing your request. It has been logged (ID 704b9f3b19536a35).
+  /person/check/duplicates:
+    post:
+      tags:
+        - 'person'
+      summary: 'Check for a duplicate person'
+      description: >
+        Checks whether a person matching the supplied details already exists. The mock matches on
+        first name, last name (case-insensitive), date of birth (same day), mobile and landline
+        (exact), where a missing date of birth or phone number only matches a person who has none,
+        ignoring the person with the supplied `id` and any deactivated people. A missing request body returns a 500, and a body that isn't a JSON
+        object returns a 400.
+      operationId: 'checkPersonDuplicates'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersonDuplicateRequest'
+      responses:
+        '200':
+          description: >
+            The matching person, or `_data: null` if no match is found. Returns result inside a
+            CapdResponse.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    oneOf:
+                      - $ref: '#/components/schemas/PersonDuplicateResponse'
+                      - type: 'null'
+                required:
+                  - '_data'
+                additionalProperties: false
+        '400':
+          description: 'The request body is not a JSON object.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 400
+                  message:
+                    type: string
+                    example: 'Unable to process JSON'
+        '500':
+          description: 'No request body was provided.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: >
+                      There was an error processing your request. It has been logged (ID 704b9f3b19536a35).
+  /person/{personId}/lock:
+    post:
+      tags:
+        - 'person'
+      summary: 'Lock Person.'
+      description: 'Request to lock a person by ID.'
+      operationId: 'lockPerson'
+      parameters:
+        - name: 'personId'
+          in: 'path'
+          description: 'The unique ID of the requested person.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [11111111, 11112222, 22222222]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LockPersonRequestBody'
+      responses:
+        '204':
+          description: 'Successfully locked person.'
+        '400':
+          description: 'Invalid reason and notes'
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Getting an internal user's details is forbidden, or a WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 'Person not found'
+          $ref: '#/components/responses/NotFound'
+        '500':
+          description: 'Error processing the request to lock a person. Reason or note exceeds the maximum length, or the upstream fails to process the request.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: 'There was an error processing your request.'
+
+  /person/{personId}/unlock:
+    post:
+      tags:
+        - 'person'
+      summary: 'Unlock Person.'
+      description: 'Request to unlock a person by ID.'
+      operationId: 'unlockPerson'
+      parameters:
+        - name: 'personId'
+          in: 'path'
+          description: 'The unique ID of the requested person.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [11111111, 11112222, 22222222]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnlockPersonRequestBody'
+      responses:
+        '204':
+          description: 'Successfully unlocked person.'
+        '400':
+          description: 'Invalid reason and notes'
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Getting an internal user's details is forbidden, or a WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 'Person not found'
+          $ref: '#/components/responses/NotFound'
+        '500':
+          description: 'Error processing the request to unlock a person. Reason or note exceeds the maximum length, or the upstream fails to process the request.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: 'There was an error processing your request.'
+
+  /person/{personId}/deactivate:
+    post:
+      tags:
+        - 'person'
+      summary: 'Deactivate Person.'
+      description: 'Request to deactivate (soft delete) a person by ID.'
+      operationId: 'deactivatePerson'
+      parameters:
+        - name: 'personId'
+          in: 'path'
+          description: 'The unique ID of the requested person.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [11111111, 11112222, 22222222]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeactivatePersonRequestBody'
+      responses:
+        '204':
+          description: 'Successfully deactivated person.'
+        '400':
+          description: 'Invalid reason and notes'
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Getting an internal user's details is forbidden, or a WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 'Person not found'
+          $ref: '#/components/responses/NotFound'
+        '500':
+          description: 'Error processing the request to deactivate a person. Reason exceeds 100 characters, note exceeds 4000 characters, or the upstream fails to process the request.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: 'There was an error processing your request.'
+
+  /person/{personId}:
+    put:
+      tags:
+        - 'person'
+      summary: 'Update Person Details.'
+      description: 'Request to update a person with the specified details.'
+      operationId: 'updatePersonDetails'
+      parameters:
+        - name: 'personId'
+          in: 'path'
+          description: 'The unique ID of the requested person.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [11111111, 11112222, 22222222]
+        - name: 'email'
+          in: 'header'
+          description: 'Email'
+          schema:
+            type: string
+            format: email
+      requestBody:
+        description: 'Person data to update'
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersonalUpdateRequest'
+      responses:
+        '204':
+          description: 'Successfully updated person details.'
+        '403':
+          description: Getting an internal user's details is forbidden, or a WAF rule has been triggered.
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 'Person not found'
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: 'Required fields are missing'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 422
+                  message:
+                    type: string
+                    example: 'HTTP 422'
+        '400':
+          description: 'Invalid JSON, or valid JSON that does not match the body schema'
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          description: 'Internal server error (e.g. the upstream fails to process the request).'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    example: 'There was an error processing your request.'
+
+components:
+  responses:
+    NotFound:
+      description: Not Found
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                example: 404
+              message:
+                type: string
+                example: HTTP 404 Not Found
+    Conflict:
+      description: Conflict
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                example: 409
+              message:
+                type: string
+                example: HTTP 409 Conflict
+    Forbidden:
+      description: Forbidden
+      content:
+        text/html:
+          schema:
+            type: string
+            example: |
+              <html><body><h1>403 Forbidden</h1>
+              Request forbidden by administrative rules.
+              </body></html>
+    BadRequest:
+      description: Bad Request
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                example: 400
+              message:
+                type: string
+                examples:
+                  - 'HTTP 400 Bad Request'
+                  - 'Unable to process JSON'
+        text/plain:
+          schema:
+            type: string
+            example: source cannot be null
+        text/html:
+          schema:
+            type: string
+            example: |
+              <html><body><h1>400 Bad request</h1>
+              Your browser sent an invalid request.
+              </body></html>
+  schemas:
+    # request objects
+    SearchRequestBody:
+      type: object
+      description: >
+        Search for a person by one of the options. The required length of `primarySearchPhrase` depends
+        on the chosen `searchFieldType`:
+          - `CUSTOMER_REFERENCE` - the full 10-digit CRN; returns 0 or 1 results.
+          - `PERSONAL_IDENTIFIER` - the full personal identifier, at least 9 characters; returns 0 or 1 results.
+          - `CUSTOMER_NAME` - partial first and/or last name (non-empty); returns 0 or more results.
+          - `CUSTOMER_POSTCODE` - full customer postcode, at least 5 characters; returns 0 or more results.
+          - `VENDOR_NUMBER` - at least the first 6 characters of the vendor number; returns 0 or more results.
+          - `TRADER_NUMBER` - at least the first 6 characters of the trader number; returns 0 or more results.
+      oneOf:
+        - title: 'Search by CRN'
+          properties:
+            searchFieldType:
+              type: string
+              enum:
+                - 'CUSTOMER_REFERENCE'
+            primarySearchPhrase:
+              oneOf:
+                - type: string
+                  minLength: 10
+                - type: integer
+                  format: int64
+                  minimum: 1000000000 # sfd-id-check: allow - validation minimum
+          required:
+            - 'searchFieldType'
+            - 'primarySearchPhrase'
+        - title: 'Search by personal identifier'
+          properties:
+            searchFieldType:
+              type: string
+              enum:
+                - 'PERSONAL_IDENTIFIER'
+            primarySearchPhrase:
+              oneOf:
+                - type: string
+                  minLength: 9
+                - type: integer
+                  format: int64
+                  minimum: 100000000 # sfd-id-check: allow - validation minimum
+          required:
+            - 'searchFieldType'
+            - 'primarySearchPhrase'
+        - title: 'Search by customer name'
+          properties:
+            searchFieldType:
+              type: string
+              enum:
+                - 'CUSTOMER_NAME'
+            primarySearchPhrase:
+              type: [string, number, boolean]
+              minLength: 1
+          required:
+            - 'searchFieldType'
+            - 'primarySearchPhrase'
+        - title: 'Search by customer postcode'
+          properties:
+            searchFieldType:
+              type: string
+              enum:
+                - 'CUSTOMER_POSTCODE'
+            primarySearchPhrase:
+              oneOf:
+                - type: string
+                  minLength: 5
+                - type: integer
+                  minimum: 10000
+          required:
+            - 'searchFieldType'
+            - 'primarySearchPhrase'
+        - title: 'Search by vendor number'
+          properties:
+            searchFieldType:
+              type: string
+              enum:
+                - 'VENDOR_NUMBER'
+            primarySearchPhrase:
+              oneOf:
+                - type: string
+                  minLength: 6
+                - type: integer
+                  minimum: 100000
+          required:
+            - 'searchFieldType'
+            - 'primarySearchPhrase'
+        - title: 'Search by trader number'
+          properties:
+            searchFieldType:
+              type: string
+              enum:
+                - 'TRADER_NUMBER'
+            primarySearchPhrase:
+              oneOf:
+                - type: string
+                  minLength: 6
+                - type: integer
+                  minimum: 100000
+          required:
+            - 'searchFieldType'
+            - 'primarySearchPhrase'
+      examples:
+        - searchFieldType: 'CUSTOMER_REFERENCE'
+          primarySearchPhrase: '9111111100'
+        - searchFieldType: 'PERSONAL_IDENTIFIER'
+          primarySearchPhrase: '910000001' # sfd-id-check: allow - personal identifier
+        - searchFieldType: 'CUSTOMER_NAME'
+          primarySearchPhrase: 'Smith'
+        - searchFieldType: 'CUSTOMER_POSTCODE'
+          primarySearchPhrase: 'AB12 3CD'
+        - searchFieldType: 'VENDOR_NUMBER'
+          primarySearchPhrase: '123456'
+        - searchFieldType: 'TRADER_NUMBER'
+          primarySearchPhrase: '654321'
+    LockPersonRequestBody:
+      type: object
+      examples:
+        - partyNoteType: 'LockPerson'
+          reason: 'Account review'
+        - partyNoteType: 'LockPerson'
+          note: 'testing locking'
+        - partyNoteType: 'LockPerson'
+          note: 'testing locking'
+          reason: 'Account review'
+      anyOf:
+        - properties:
+            partyNoteType:
+              type: string
+              enum:
+                - 'LockPerson'
+            reason:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                  minLength: 1
+            note:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                - type: 'null'
+          required: ['partyNoteType', 'reason']
+        - properties:
+            partyNoteType:
+              type: string
+              enum:
+                - 'LockPerson'
+            note:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                  minLength: 1
+            reason:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                - type: 'null'
+          required: ['partyNoteType', 'note']
+    UnlockPersonRequestBody:
+      type: object
+      examples:
+        - partyNoteType: 'UnlockPerson'
+          reason: 'Account review'
+        - partyNoteType: 'UnlockPerson'
+          note: 'testing locking'
+        - partyNoteType: 'UnlockPerson'
+          note: 'testing locking'
+          reason: 'Account review'
+      anyOf:
+        - properties:
+            partyNoteType:
+              type: string
+              enum:
+                - 'UnlockPerson'
+            reason:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                  minLength: 1
+            note:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                - type: 'null'
+          required: ['partyNoteType', 'reason']
+        - properties:
+            partyNoteType:
+              type: string
+              enum:
+                - 'UnlockPerson'
+            note:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                  minLength: 1
+            reason:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                - type: 'null'
+          required: ['partyNoteType', 'note']
+    DeactivatePersonRequestBody:
+      type: object
+      examples:
+        - partyNoteType: 'DeactivatePerson'
+          reason: 'Customer deceased'
+        - partyNoteType: 'DeactivatePerson'
+          note: 'Confirmed by next of kin'
+        - partyNoteType: 'DeactivatePerson'
+          reason: 'Customer deceased'
+          note: 'Confirmed by next of kin'
+      anyOf:
+        - properties:
+            partyNoteType:
+              type: string
+              enum:
+                - 'DeactivatePerson'
+            reason:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                  minLength: 1
+            note:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                - type: 'null'
+          required: ['partyNoteType', 'reason']
+        - properties:
+            partyNoteType:
+              type: string
+              enum:
+                - 'DeactivatePerson'
+            note:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                  minLength: 1
+            reason:
+              oneOf:
+                - type: number
+                - type: boolean
+                - type: string
+                - type: 'null'
+          required: ['partyNoteType', 'note']
+    PersonDuplicateRequest:
+      type: object
+      properties:
+        id:
+          type: [integer, 'null']
+          format: int64
+        firstName:
+          type: [string, 'null']
+        lastName:
+          type: [string, 'null']
+        dateOfBirth:
+          oneOf:
+            - type: integer
+              description: 'Epoch milliseconds'
+            - type: string
+              format: date-time
+            - type: 'null'
+        landline:
+          type: [string, 'null']
+        mobile:
+          type: [string, 'null']
+    PersonalUpdateRequest:
+      type: 'object'
+      properties:
+        title:
+          oneOf:
+            - type: string
+              maxLength: 20
+            - type: integer
+              format: int64
+              minimum: -9007199254740991
+              maximum: 9007199254740991
+            - type: boolean
+            - type: 'null'
+          description: 'Title of the person (e.g., Mr, Mrs)'
+        otherTitle:
+          oneOf:
+            - type: string
+              maxLength: 100
+            - type: number
+            - type: boolean
+            - type: 'null'
+          description: 'Alternative or additional title'
+        firstName:
+          oneOf:
+            - type: string
+              minLength: 1
+              maxLength: 100
+            - type: number
+            - type: boolean
+          description: 'First name of the person'
+        middleName:
+          oneOf:
+            - type: string
+              maxLength: 100
+            - type: number
+            - type: boolean
+            - type: 'null'
+          description: 'Middle name of the person'
+        lastName:
+          oneOf:
+            - type: string
+              minLength: 1
+              maxLength: 100
+            - type: number
+            - type: boolean
+          description: 'Last name of the person'
+        dateOfBirth:
+          description: 'Date of birth as a Unix timestamp in milliseconds. Must be before the current time.'
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: -999999999999999
+              maximum: 9999999999999
+            - type: string
+              pattern: '^(-[0-9]{1,15}$|^[0-9]{1,13})?$'
+            - type: 'null'
+        landline:
+          oneOf:
+            - type: string
+              pattern: '^((\+| *)([0-9] *){5,})?$'
+            - type: 'null'
+          description: 'Landline phone number'
+        mobile:
+          oneOf:
+            - type: string
+              pattern: '^((\+| *)([0-9] *){5,})?$'
+            - type: 'null'
+          description: 'Mobile phone number'
+        email:
+          oneOf:
+            - type: string
+              pattern: '^([A-Za-z0-9+_-]+(\.[A-Za-z0-9+_-]+)*@([A-Za-z]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,})?$'
+            - type: 'null'
+          description: 'Email address'
+        address:
+          oneOf:
+            - type: object
+              properties:
+                address1:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                address2:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                address3:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                address4:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                address5:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                pafOrganisationName:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                flatName:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                buildingNumberRange:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                buildingName:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                street:
+                  oneOf: [{ type: string, maxLength: 240 }, { type: 'null' }]
+                city:
+                  oneOf: [{ type: string, maxLength: 60 }, { type: 'null' }]
+                county:
+                  oneOf: [{ type: string, maxLength: 60 }, { type: 'null' }]
+                postalCode:
+                  oneOf: [{ type: string, maxLength: 8 }, { type: 'null' }]
+                country:
+                  oneOf: [{ type: string, maxLength: 100 }, { type: 'null' }]
+                uprn:
+                  oneOf: [{ type: string, maxLength: 12 }, { type: 'null' }]
+            - type: 'null'
+      required:
+        - firstName
+        - lastName
+
+    # response objects
+    PersonSearchResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+        fullName:
+          type: string
+        primaryAddress:
+          oneOf:
+            - $ref: '#/components/schemas/Address'
+            - type: 'null'
+        personalIdentifiers:
+          type: array
+          items:
+            type: string
+        nationalInsuranceNumber:
+          type: [string, 'null']
+        customerReference:
+          type: string
+        email:
+          type: [string, 'null']
+        locked:
+          type: boolean
+        deactivated:
+          type: boolean
+      required:
+        - 'id'
+        - 'fullName'
+        - 'primaryAddress'
+        - 'personalIdentifiers'
+        - 'nationalInsuranceNumber'
+        - 'customerReference'
+        - 'email'
+        - 'locked'
+        - 'deactivated'
+    PersonDuplicateResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        customerReferenceNumber:
+          type: string
+        firstName:
+          type: string
+        lastName:
+          type: string
+        landline:
+          type: [string, 'null']
+        mobile:
+          type: [string, 'null']
+        dateOfBirth:
+          type: [integer, 'null']
+        id:
+          type: integer
+      required:
+        - 'customerReferenceNumber'
+        - 'firstName'
+        - 'lastName'
+        - 'landline'
+        - 'mobile'
+        - 'dateOfBirth'
+        - 'id'
+    PersonCreatedResponse:
+      type: string
+      description: The customer reference number of the created person
+    Page:
+      type: object
+      properties:
+        number:
+          type: integer
+          format: 'int32'
+        size:
+          type: integer
+          format: 'int32'
+        totalPages:
+          type: integer
+          format: 'int32'
+        numberOfElements:
+          type: integer
+          format: 'int32'
+        totalElements:
+          type: integer
+          format: 'int64'
+    Address:
+      type: object
+      additionalProperties: false
+      properties:
+        address1:
+          type: [string, 'null']
+        address2:
+          type: [string, 'null']
+        address3:
+          type: [string, 'null']
+        address4:
+          type: [string, 'null']
+        address5:
+          type: [string, 'null']
+        pafOrganisationName:
+          type: [string, 'null']
+        flatName:
+          type: [string, 'null']
+        buildingNumberRange:
+          type: [string, 'null']
+        buildingName:
+          type: [string, 'null']
+        street:
+          type: [string, 'null']
+        city:
+          type: [string, 'null']
+        county:
+          type: [string, 'null']
+        postalCode:
+          type: [string, 'null']
+        country:
+          type: [string, 'null']
+        uprn:
+          type: [string, 'null']
+        dependentLocality:
+          type: [string, 'null']
+        doubleDependentLocality:
+          type: [string, 'null']
+        addressTypeId:
+          type: [string, 'null']
+      required:
+        - 'address1'
+        - 'address2'
+        - 'address3'
+        - 'address4'
+        - 'address5'
+        - 'addressTypeId'
+        - 'buildingName'
+        - 'buildingNumberRange'
+        - 'city'
+        - 'country'
+        - 'county'
+        - 'dependentLocality'
+        - 'doubleDependentLocality'
+        - 'flatName'
+        - 'pafOrganisationName'
+        - 'postalCode'
+        - 'street'
+        - 'uprn'
+
+    PartyDigitalContact:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+        partyId:
+          type: integer
+        mdmPartyContactId:
+          type: [integer, 'null']
+        digitalContactType:
+          $ref: '#/components/schemas/DigitalContactType'
+        digitalAddress:
+          type: [string, 'null']
+        validated:
+          type: boolean
+      required:
+        - 'id'
+        - 'partyId'
+        - 'mdmPartyContactId'
+        - 'digitalContactType'
+        - 'digitalAddress'
+        - 'validated'
+    DigitalContactType:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+        type:
+          type: [string, 'null']
+      required:
+        - 'id'
+        - 'type'
+
+    FullPersonDetails:
+      type: object
+      additionalProperties: false
+      properties:
+        title:
+          type: [string, 'null']
+        otherTitle:
+          type: [string, 'null']
+        firstName:
+          type: string
+        middleName:
+          type: [string, 'null']
+        lastName:
+          type: string
+        dateOfBirth:
+          type: [integer, 'null']
+        landline:
+          type: [string, 'null']
+        mobile:
+          type: [string, 'null']
+        email:
+          type: [string, 'null']
+        doNotContact:
+          type: boolean
+        emailValidated:
+          type: boolean
+        address:
+          oneOf:
+            - $ref: '#/components/schemas/Address'
+            - type: 'null'
+        locked:
+          type: boolean
+        id:
+          type: integer
+        confirmed:
+          type: boolean
+        customerReferenceNumber:
+          type: string
+        personalIdentifiers:
+          type: array
+          items:
+            type: string
+        deactivated:
+          type: boolean
+      required:
+        - 'title'
+        - 'otherTitle'
+        - 'firstName'
+        - 'middleName'
+        - 'lastName'
+        - 'dateOfBirth'
+        - 'landline'
+        - 'mobile'
+        - 'email'
+        - 'doNotContact'
+        - 'emailValidated'
+        - 'address'
+        - 'locked'
+        - 'id'
+        - 'confirmed'
+        - 'customerReferenceNumber'
+        - 'personalIdentifiers'
+        - 'deactivated'
+
+  securitySchemes:
+    mTLS:
+      type: mutualTLS
+      description: >
+        Mutual TLS authentication. Client must present a certificate issued by the server.

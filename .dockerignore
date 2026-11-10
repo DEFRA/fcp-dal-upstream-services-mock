@@ -1,4 +1,7 @@
-node_modules
-Dockerfile
+.git*
+.sonarlint
+.vscode
 coverage
-**/*.test.js
+Dockerfile
+node_modules
+sonar-project.properties

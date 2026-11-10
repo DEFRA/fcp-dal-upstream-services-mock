@@ -1,0 +1,408 @@
+openapi: '3.0.1'
+info:
+  title: CS Tool Service
+  version: v1
+  x-source-repository: cs-tool-service
+  description: |
+    Countryside Stewardship (CS) Tool — Dropwizard/Jersey service that evaluates farmer
+    questionnaire answers against a configuration matrix of CS options and National
+    Character Areas (NCAs), and returns graded suggestions (high / medium / low) for CS
+    scheme options the farmer may be eligible for.
+
+    **Purpose**: Supports the Countryside Stewardship application journey. Given a set of
+    answers to land-type and interest questions, the service cross-references the farmer's
+    NCAs (fetched from capd-lms-land-view) against a configuration matrix (loaded from CSV
+    into a database) to produce a ranked list of CS options.
+
+    **Upstream consumers**: Portal front-end (CS application flow).
+    **Downstream dependencies**:
+    - `capd-lms-land-view` service (`LmsViewLandClient`) — fetches NCAs for a business
+    - CS Tool database — stores options, configuration matrix, and NCAs (populated from CSV)
+
+    **Authentication / Authorisation**: `callerId` and `userType` headers are required on
+    business-related endpoints. No authentication scheme is formally declared (internal
+    service).
+
+    **Admin endpoints** (`/reloadDatabase`, `/reloadCache`) are not protected by
+    authentication. These should be called only by operators.
+
+    **Caching**: NCA, Options and Configuration Matrix are loaded into in-memory caches
+    on startup and via `GET /reloadCache`. The CSV-based reload (`GET /reloadDatabase`)
+    replaces database content from CSV files, then requires a cache reload.
+
+servers:
+  - url: http://localhost:8080
+    description: Local Dropwizard development server
+
+tags:
+  - name: answers
+    description: CS Tool answer submission and suggestion generation
+  - name: nca
+    description: National Character Area lookup for a business
+  - name: admin
+    description: Administrative cache and database reload endpoints
+  - name: status
+    description: Application health check
+
+paths:
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application health check
+      operationId: getStatus
+      description: Returns plain text indicating service health.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /answers/{businessId}:
+    post:
+      tags:
+        - answers
+      summary: Submit Countryside Stewardship answers and get suggestions
+      operationId: postAnswers
+      description: |
+        Accepts a map of question answers (land type and interest questions), fetches the
+        business's NCAs from `capd-lms-land-view`, and returns a three-tier suggestion
+        response (high / medium / low priority CS options).
+
+        **Algorithm**:
+        1. Fetch NCAs for `businessId` from `lmsViewLandClient.getNationalCharacterAreas(callerId, userType, businessId)`.
+        2. Call `csToolService.generateSuggestions(answers, businessNcaList)`.
+        3. For each row in the CS configuration matrix, filter by:
+           - NCA: the config row's NCA code matches at least one of the business's NCAs.
+           - Land answers: at least one land question (Q1–Q4) is answered `true` in both the
+             config row and the submitted answers.
+           - Interest answers: at least one interest question (Q5–Q11/sub-questions) is
+             answered `true` in both the config row and submitted answers.
+        4. Deduplicate by `optionCode`. Separate into HIGH, MEDIUM, LOW tiers (from Level enum).
+           MEDIUM excludes options already in HIGH. LOW excludes options in HIGH or MEDIUM.
+
+        **Validation**: No explicit validation of the `answers` map. Null `callerId` causes
+        `NullPointerException` when calling the LMS client. An unrecognised `userType` value
+        causes `IllegalArgumentException` from `UserType.valueOf(userType)`.
+
+        **Question keys** (`AnswersRequest.answers` map keys are enum constant names):
+        - Land type: `Q1` (arable-land), `Q2` (grassland), `Q3` (sda — Severely
+          Disadvantaged Area), `Q4` (organic-land)
+        - Interest: `Q5` (bird-pollinator), `Q6` (wader), `Q7` (water), `Q8` (historic),
+          `Q9` (landscape), `Q10` (air), `Q11` (educational)
+        - Water sub-questions: `Q7_1` (phosphate-surface), `Q7_2` (nitrates-surface),
+          `Q7_3` (nitrates-ground), `Q7_4` (pesticides-surface), `Q7_5` (pesticides-ground),
+          `Q7_6` (priority-bathing)
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - $ref: '#/components/parameters/businessId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnswersRequest'
+            example:
+              answers:
+                Q1: true
+                Q2: false
+                Q5: true
+                Q8: true
+      responses:
+        '200':
+          description: CS option suggestions categorised by priority
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NcaSuggestionsResponse'
+        '500':
+          description: |
+            Unhandled exception. Common causes:
+            - `callerId` header is null → `NullPointerException` when calling LMS client
+            - `userType` header is an unrecognised value → `IllegalArgumentException`
+              from `UserType.valueOf(userType)`
+            - LMS client call failure (downstream capd-lms-land-view unavailable)
+
+  /answersWithNca/{businessId}:
+    post:
+      tags:
+        - answers
+      summary: Submit answers with selected NCAs and get filtered suggestions
+      operationId: postAnswersWithNca
+      description: |
+        Accepts answers plus an explicit list of NCA codes. Fetches the full NCA list for
+        `businessId` from `lmsViewLandClient`, then filters it to only the NCAs whose `code`
+        is in the supplied `nca` list before running suggestion generation.
+
+        **Algorithm**: Same as `POST /answers/{businessId}`, except the NCA list is pre-filtered
+        to the NCAs selected in `answersWithNcaRequest.nca` before generating suggestions.
+        This allows the user to scope suggestions to specific character areas.
+
+        **Validation**: Same as `/answers/{businessId}`. No explicit validation on `nca` list.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - $ref: '#/components/parameters/businessId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnswersWithNcaRequest'
+            example:
+              answers:
+                Q1: true
+                Q5: true
+              nca:
+                - '101'
+                - '102'
+      responses:
+        '200':
+          description: CS option suggestions filtered to selected NCAs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NcaSuggestionsResponse'
+        '500':
+          description: |
+            Unhandled exception. Same causes as `POST /answers/{businessId}`:
+            null `callerId`, invalid `userType`, or LMS client failure.
+
+  /nca/{businessId}:
+    get:
+      tags:
+        - nca
+      summary: Get National Character Areas for a business
+      operationId: getBusinessNcas
+      description: |
+        Fetches the NCAs for the given business from `capd-lms-land-view` and maps them to
+        `NcaResponse` objects (code, name, url). Used by the front-end to populate the NCA
+        selection UI before submitting answers with NCAs.
+
+        **Validation** (explicit in source):
+        - `userType` null or empty → HTTP 400 (no body)
+        - `callerId` null → HTTP 400 (no body)
+        - `businessId` null → HTTP 400 (no body)
+
+        **Note**: The original spec's summary ("Replaces current DB content") is incorrect
+        (copy-paste error in source code `@Documentation` annotation). This endpoint only
+        reads NCA data.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - $ref: '#/components/parameters/userType'
+        - $ref: '#/components/parameters/businessId'
+      responses:
+        '200':
+          description: NCAs associated with the business
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NcaResponse'
+        '400':
+          description: |
+            Missing required header or path parameter. Triggered when any of `userType`,
+            `callerId` or `businessId` is null or empty.
+
+  /reloadDatabase:
+    get:
+      tags:
+        - admin
+      summary: Reload CS Tool database from CSV files
+      operationId: reloadDatabaseContent
+      description: |
+        Replaces the current database content (CS options, configuration matrix, and NCAs)
+        with data parsed from CSV files configured in the application config
+        (`csvReload.optionsPath`, `csvReload.configPath`, `csvReload.ncasPath`).
+
+        **Warning**: This is a destructive admin operation. It deletes all existing options,
+        configuration matrix rows, and NCAs, then inserts fresh data from CSV files.
+        After calling this endpoint, call `GET /reloadCache` to update in-memory caches.
+
+        **No authentication**: This endpoint has no access control. Restrict via network.
+
+        **Response**: Plain text "DB content reloaded successfully" on HTTP 200.
+      responses:
+        '200':
+          description: Database reloaded from CSV files
+          content:
+            application/json:
+              schema:
+                type: string
+              example: DB content reloaded successfully
+
+  /reloadCache:
+    get:
+      tags:
+        - admin
+      summary: Reload in-memory caches from the database
+      operationId: reloadCache
+      description: |
+        Clears the Hibernate second-level cache and reloads the in-memory caches for:
+        - NCA (National Character Areas)
+        - CS Options
+        - Configuration Matrix (CS Config rows)
+
+        **When to call**: After `GET /reloadDatabase` or after any direct database change.
+        Must be called for new database content to take effect on suggestion generation.
+
+        **No authentication**: This endpoint has no access control. Restrict via network.
+
+        **Response**: Plain text "Caches reloaded successfully" on HTTP 200.
+      responses:
+        '200':
+          description: Caches reloaded from database
+          content:
+            application/json:
+              schema:
+                type: string
+              example: Caches reloaded successfully
+
+components:
+  parameters:
+    callerId:
+      name: callerId
+      in: header
+      required: false
+      description: |
+        Internal CAPD caller identifier (BigInteger). Required for business-related
+        endpoints. If null, causes a downstream NullPointerException.
+      schema:
+        type: integer
+    userType:
+      name: userType
+      in: header
+      required: false
+      description: |
+        User type classification (String). Must be a valid `UserType` enum value.
+        An unrecognised value causes `IllegalArgumentException`.
+      schema:
+        type: string
+        enum:
+          - external
+          - internal
+          - ida_no_match
+    businessId:
+      name: businessId
+      in: path
+      required: true
+      description: Organisation / business identifier (BigInteger). Used to fetch NCAs from LMS.
+      schema:
+        type: integer
+
+  schemas:
+    AnswersRequest:
+      type: object
+      x-validation-source: AnswersRequest.java
+      description: |
+        Countryside Stewardship questionnaire answers. The `answers` field is a map of
+        question key → boolean answer. Keys are the Java enum constant names from the
+        `Questions` enum. See endpoint description for the full list.
+      properties:
+        answers:
+          type: object
+          description: |
+            Map of question code → boolean answer. Valid keys (Questions enum constant names):
+            - Land type: Q1, Q2, Q3, Q4
+            - Interest: Q5, Q6, Q7, Q8, Q9, Q10, Q11
+            - Water sub-questions: Q7_1, Q7_2, Q7_3, Q7_4, Q7_5, Q7_6
+            Only the questions relevant to the farmer need to be included. Unrecognised
+            keys are ignored.
+          additionalProperties:
+            type: boolean
+          example:
+            Q1: true
+            Q2: false
+            Q5: true
+
+    AnswersWithNcaRequest:
+      type: object
+      x-validation-source: AnswersWithNcaRequest.java
+      description: |
+        Extends `AnswersRequest` with an explicit NCA selection. The `nca` list contains
+        NCA codes to scope suggestion generation to. If the NCA code is not in the
+        business's NCA list (as returned by LMS), it is ignored.
+      allOf:
+        - $ref: '#/components/schemas/AnswersRequest'
+        - type: object
+          properties:
+            nca:
+              type: array
+              description: |
+                List of NCA codes to scope suggestions to. Filters the business's NCA list
+                before running suggestion generation. Filtering uses NCA `code` equality.
+              items:
+                type: string
+              example:
+                - '101'
+                - '204'
+
+    NcaSuggestionsResponse:
+      type: object
+      x-validation-source: NcaSuggestionsResponse.java
+      description: |
+        CS option suggestions categorised by priority tier. Each tier is a list of
+        `NcaSuggestion` objects, deduplicated by `optionCode`. Options are sorted by
+        `NcaSuggestionComparator`. An option appears only in the highest tier it qualifies
+        for (MEDIUM excludes HIGH options; LOW excludes HIGH and MEDIUM options).
+      properties:
+        high:
+          type: array
+          description: High-priority CS option suggestions
+          items:
+            $ref: '#/components/schemas/NcaSuggestion'
+        medium:
+          type: array
+          description: Medium-priority CS option suggestions (excludes options already in high)
+          items:
+            $ref: '#/components/schemas/NcaSuggestion'
+        low:
+          type: array
+          description: Low-priority CS option suggestions (excludes options already in high or medium)
+          items:
+            $ref: '#/components/schemas/NcaSuggestion'
+
+    NcaSuggestion:
+      type: object
+      x-validation-source: NcaSuggestion.java
+      description: A single Countryside Stewardship option suggestion, linked to an NCA.
+      properties:
+        ncaName:
+          type: string
+          description: Name of the National Character Area this option is associated with
+        ncaUrl:
+          type: string
+          description: URL to the NCA Statement of Priorities document
+        optionCode:
+          type: string
+          description: CS option code (e.g. "BE3", "HK6")
+        optionName:
+          type: string
+          description: CS option name
+        optionUrl:
+          type: string
+          description: URL to further information about the CS option
+        description:
+          type: string
+          description: Description / text for this CS option (from the options database)
+
+    NcaResponse:
+      type: object
+      x-validation-source: NcaResponse.java
+      description: |
+        A National Character Area as returned by the `/nca/{businessId}` endpoint.
+        Mapped from the `NationalCharacterArea` domain object returned by LMS.
+      properties:
+        code:
+          type: string
+          description: NCA code identifier
+        name:
+          type: string
+          description: NCA name
+        url:
+          type: string
+          description: URL to the NCA Statement of Priorities

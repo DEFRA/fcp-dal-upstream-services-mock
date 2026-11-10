@@ -1,0 +1,873 @@
+openapi: '3.0.1'
+info:
+  title: Bank Change Service
+  version: v1
+  x-source-repository: bank-change-service
+  description: |
+    Orchestrates the end-to-end bank account change flow for Rural Payments portal organisations.
+    Validates bank account details against LexisNexis (via bank-details-validator-service),
+    enforces business locking and editability rules, and submits confirmed changes to the Azure
+    Service Bus for downstream processing.
+
+    **Upstream consumers**: capd-frontends (external portal), capd-play-auth (auth gateway).
+
+    **Downstream dependencies**:
+    - bank-details-validator-service — LexisNexis account-validation proxy
+    - Azure Service Bus — receives confirmed bank-change messages for processing
+    - DAX external accounts API — returns existing accounts for a given FRN
+    - SitiAgri authorisation service — caller empowerment checks
+
+    **Authentication**: No authentication scheme is declared in this service. Authentication
+    is enforced upstream by capd-play-auth before requests reach this service.
+
+    **Validation layers**:
+    1. Spring `@RequestBody` Jackson deserialization (type coercion only; no JSR-303 annotations on DTOs)
+    2. Service-layer business rules (`BankChangesValidatorService`, `LockedStatusValidationService`,
+       `AccountStatusValidationService`) reading BANK_DETAILS, PERSON_BANK_DETAILS, and
+       REVISION_INFORMATION tables
+    3. `MandatoryFieldsValidator` — explicit null/blank checks before Azure Service Bus dispatch
+
+    **Important**: All path parameters that map to database IDs (organisationId, personId) must be
+    numeric strings parseable as `Long`. Non-numeric values cause a `NumberFormatException` at
+    the service layer which surfaces as HTTP 500.
+
+servers:
+  - url: http://localhost:9040
+    description: Local development server (default Spring Boot port)
+
+tags:
+  - name: bank-change
+    description: Bank account change submission, validation, and status operations
+  - name: information
+    description: Reference data lookups (country codes from LexisNexis, existing accounts from DAX)
+
+paths:
+  /bank-change-service/v1/validate:
+    post:
+      tags:
+        - bank-change
+      summary: Validate bank change details against pre-checks and LexisNexis
+      operationId: validateBankDetails
+      description: |
+        Validates submitted bank-account details through a series of in-service pre-checks before
+        delegating to LexisNexis via bank-details-validator-service.
+
+        **Pre-processing** (applied before validation by `Transformer.modifyDefaultValues`):
+        For `UK_PERSONAL` and `UK_BUSINESS` account types, `country.code` is automatically set
+        to `"GB"` before any validation or downstream call. Consumers do not need to supply a
+        country code for UK account types — it will be overwritten regardless.
+
+        **Pre-check validation order** (handled by `BankChangesValidatorService.isValid`):
+
+        1. **New account check** — If the organisation or person was created within the last 24 hours,
+           the pre-check returns `FAILED` immediately and LexisNexis is NOT called. Both organisationId
+           and personId are looked up in the REVISION_INFORMATION table by partyId. If personId is
+           absent from the request, only the organisation creation time is checked.
+
+        2. **Recent submission check** — If BANK_DETAILS.status = `SUBMITTED` AND
+           BANK_DETAILS.lastUpdatedOn is within the last 14 days, the pre-check returns `FAILED`.
+
+        3. **Lock check** — If PERSON_BANK_DETAILS.updateAttempts >= 3 AND
+           PERSON_BANK_DETAILS.lastUpdatedOn is within the last 24 hours, the pre-check returns
+           `FAILED`. If lastUpdatedOn is outside the 24-hour window, updateAttempts is reset to 0
+           and validation is allowed to proceed.
+
+        4. **LexisNexis delegation** — If all pre-checks pass, the request is forwarded to
+           bank-details-validator-service. The response `status` will be `MATCH`, `PARTIAL_MATCH`,
+           or `FAILED` from LexisNexis.
+
+        **Attempt tracking** (side effects on every call):
+        - PERSON_BANK_DETAILS.updateAttempts is incremented on every call (pass or fail).
+        - BANK_DETAILS.status is set to `VALIDATED_FAILED` if LexisNexis returns `FAILED`.
+        - `attemptsRemaining` in the response reflects remaining attempts before lock (maximum 3).
+        - If no BANK_DETAILS record exists, new BANK_DETAILS and PERSON_BANK_DETAILS records are
+          created; `attemptsRemaining` = 2 on the first call (MAX_ALLOWED_ATTEMPTS - 1).
+
+        **HTTP 500**: Consumers must treat HTTP 500 as equivalent to a locked state.
+
+        **Source**: `BankChangesValidatorService.java`, `LockedStatusValidationService.java`,
+        `AccountStatusValidationService.java`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidationRequest'
+            examples:
+              ukAccount:
+                summary: UK personal account validation
+                value:
+                  organisationId: '987654321' # sfd-id-check: allow - organisation ID
+                  personId: '123456789' # sfd-id-check: allow - person ID
+                  account:
+                    accountType: UK_PERSONAL
+                    name: John Doe
+                    number: '12345678'
+                    bank:
+                      sortCode: '123456'
+                  country:
+                    code: GBR
+                    currency: GBP
+              euAccount:
+                summary: EU IBAN account validation
+                value:
+                  organisationId: '987654321' # sfd-id-check: allow - organisation ID
+                  personId: '123456789' # sfd-id-check: allow - person ID
+                  account:
+                    accountType: EU
+                    name: Jane Smith
+                    iban: PT392831273127334616
+                    bank:
+                      swiftCode: 'ABCDPTPL'
+                  country:
+                    code: IRL
+                    currency: EUR
+      responses:
+        '200':
+          description: |
+            Validation executed. HTTP 200 is returned regardless of the validation outcome.
+            Always inspect the `status` field: `MATCH` or `PARTIAL_MATCH` = LexisNexis accepted;
+            `FAILED` = a pre-check failed or LexisNexis rejected the details.
+            `attemptsRemaining` indicates how many more failed attempts are permitted before lock.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResponse'
+              examples:
+                match:
+                  summary: LexisNexis matched
+                  value:
+                    status: MATCH
+                    message: All good
+                    attemptsRemaining: 2
+                    account:
+                      iban: PT392831273127334616
+                      bank:
+                        name: Acme Bank
+                        sortCode: '04835'
+                        swiftCode: '8741236'
+                failed:
+                  summary: Pre-check failed (locked, new account, or recently submitted)
+                  value:
+                    status: FAILED
+                    attemptsRemaining: 0
+        '500':
+          description: |
+            Unexpected service error. Consumers must treat HTTP 500 as locked and not allow
+            another attempt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+  /bank-change-service/v1/submit:
+    post:
+      tags:
+        - bank-change
+      summary: Submit a confirmed bank change to Azure Service Bus
+      operationId: submitBankChange
+      description: |
+        Submits a confirmed bank change for processing. The request body is validated by
+        `MandatoryFieldsValidator` before dispatch to Azure Service Bus. No JSR-303 annotations
+        are present on the DTOs; all validation is imperative code.
+
+        **Validation rules enforced by MandatoryFieldsValidator** (HTTP 400 on any failure):
+        - `organisationId`: must not be blank
+        - `personId`: must not be blank
+        - `sbi`: must not be blank
+        - `frn`: must not be blank
+        - `crn`: must not be blank
+        - `submissionDateTime`: must not be blank (expected format: `dd/MM/yyyy HH:mm:ss` — no
+          formal date parsing is applied; value is passed as a string to the Service Bus message)
+        - `account`: must not be null
+        - `account.accountType`: must not be null
+        - `account.name`: must not be blank
+        - `account.number` OR `account.iban`: at least one must be non-blank
+        - `account.bank`: must not be null
+        - `account.bank.name`: must not be blank
+
+        On validation failure the error description is a comma-separated list of missing field
+        names (no spaces after commas) with " is missing" appended (e.g. `"SBI,FRN is missing"`).
+        The delimiter is a comma only — `StringJoiner(",", "", " is missing")` — so do not
+        expect spaces between field names.
+
+        HTTP 200 = message dispatched to Service Bus. HTTP 400 = mandatory field check failed.
+        HTTP 500 = unexpected error (e.g. Azure Service Bus unavailable).
+
+        **Source**: `MandatoryFieldsValidator.java`, `BankChangeSubmissionService.java`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmissionRequest'
+            examples:
+              ukPersonal:
+                summary: UK personal bank account submission
+                value:
+                  organisationId: '987654321' # sfd-id-check: allow - organisation ID
+                  personId: '123456789' # sfd-id-check: allow - person ID
+                  sbi: '823456789'
+                  frn: '123456789' # sfd-id-check: allow - FRN
+                  crn: '9123456789'
+                  submissionDateTime: '01/02/2023 14:12:11'
+                  account:
+                    accountType: UK_PERSONAL
+                    name: John Doe
+                    number: '12345678'
+                    bank:
+                      name: Acme Bank
+                      sortCode: '123456'
+                  country:
+                    code: GBR
+                    currency: GBP
+      responses:
+        '200':
+          description: Bank change accepted and dispatched to Azure Service Bus
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                success:
+                  value: {}
+        '400':
+          description: |
+            Mandatory field validation failed. `errors[].description` is a comma-separated list
+            of missing field names followed by " is missing" (e.g. `"SBI, FRN is missing"`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                missingFields:
+                  value:
+                    errors:
+                      - code: 400
+                        description: 'SBI,FRN is missing'
+        '500':
+          description: Unexpected service error (e.g. Azure Service Bus unavailable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DefaultResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+  /bank-change-service/v1/locked-status/{organisationId}/{personId}:
+    get:
+      tags:
+        - bank-change
+      summary: Check whether a bank-change account is locked
+      operationId: lockedStatus
+      description: |
+        Returns the lock state for the given organisation/person combination by reading the
+        PERSON_BANK_DETAILS table.
+
+        **Locking logic** (from `LockedStatusValidationService`):
+        - `locked = true` when ALL of: PERSON_BANK_DETAILS.lastUpdatedOn is within the last 24
+          hours AND PERSON_BANK_DETAILS.updateAttempts >= 3.
+        - If lastUpdatedOn is older than 24 hours (window expired), `locked = false` regardless
+          of attempt count.
+        - If no PERSON_BANK_DETAILS record exists for the combination, the response body is an
+          empty JSON object `{}` (locked defaults to false and is omitted by @JsonInclude.NON_EMPTY).
+
+        **HTTP 500**: Consumers must treat a 500 response as locked.
+
+        **Source**: `LockedStatusValidationService.java`
+          Constants: LAST_UPDATED_ON_EXPIRED_IN_HOURS = 24, MAX_ALLOWED_ATTEMPTS = 3
+      parameters:
+        - name: organisationId
+          in: path
+          required: true
+          description: |
+            Internal organisation identifier. Must be a numeric string parseable as Long.
+            Non-numeric values cause HTTP 500.
+          schema:
+            type: string
+        - name: personId
+          in: path
+          required: true
+          description: |
+            Internal person identifier. Must be a numeric string parseable as Long.
+            Non-numeric values cause HTTP 500.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Lock status evaluated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LockedStatusResponse'
+              examples:
+                locked:
+                  summary: Account is locked (>= 3 attempts within 24 hours)
+                  value:
+                    locked: true
+                unlocked:
+                  summary: Account is not locked
+                  value:
+                    locked: false
+                noRecord:
+                  summary: No PERSON_BANK_DETAILS record found — treated as unlocked
+                  value: {}
+        '500':
+          description: Unexpected service error — treat as locked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LockedStatusResponse'
+              examples:
+                error:
+                  value:
+                    locked: true
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+  /bank-change-service/v1/existing-accounts/{frn}:
+    get:
+      tags:
+        - information
+      summary: Retrieve existing bank accounts from DAX for a given FRN
+      operationId: getExistingAccounts
+      description: |
+        Returns a list of existing bank accounts held in the DAX external system for the given
+        Firm Reference Number (FRN). Each entry contains the last 4 digits of the account number
+        and the currency code.
+
+        No FRN format validation is applied at the controller level. Any format constraints are
+        enforced by the downstream DAX service and are not documented here.
+
+        HTTP 500 indicates a downstream DAX call failure.
+
+        **Source**: `InformationController.java`, `DAXExistingAccountsService.java`
+      parameters:
+        - name: frn
+          in: path
+          required: true
+          description: Firm Reference Number. No format constraint enforced by this service.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Existing accounts returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExistingAccountsResponse'
+              examples:
+                accounts:
+                  value:
+                    accounts:
+                      - number: '1234'
+                        currency: GBP
+                      - number: '5678'
+                        currency: EUR
+        '500':
+          description: Downstream DAX call failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExistingAccountsResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+  /bank-change-service/v1/country-codes:
+    get:
+      tags:
+        - information
+      summary: Retrieve country codes and currencies from LexisNexis
+      operationId: getCountryAndCurrency
+      description: |
+        Returns a map of country code strings to currency code strings, sourced dynamically from
+        the LexisNexis service via bank-details-validator-service. Results are cached by
+        `CachedCountryCurrencyService` to avoid repeated downstream calls.
+
+        The country code format depends on what LexisNexis returns and cannot be statically
+        enumerated in this spec. Controller-level examples show ISO 3166-1 alpha-2 codes (GB, IE).
+        Use the keys returned by this endpoint when populating `country.code` in requests.
+
+        HTTP 500 indicates a LexisNexis call failure.
+
+        **Source**: `InformationController.java`, `CachedCountryCurrencyService.java`
+      responses:
+        '200':
+          description: Country-currency map returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountriesCurrencyResponse'
+              examples:
+                sample:
+                  summary: Example subset of country-currency pairs
+                  value:
+                    countriesCurrency:
+                      GB: GBP
+                      IE: EUR
+                      PT: EUR
+                      US: USD
+        '500':
+          description: Downstream LexisNexis call failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountriesCurrencyResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+  /bank-change-service/v1/account-status/{organisationId}:
+    get:
+      tags:
+        - bank-change
+      summary: Check account editability and submission status
+      operationId: accountStatus
+      description: |
+        Returns whether a bank account is editable, newly created, or recently submitted by
+        reading the BANK_DETAILS and REVISION_INFORMATION tables.
+
+        **Business rules** (from `AccountStatusValidationService`):
+
+        - `new=true, editable=false`: Organisation was created within the last 24 hours. The check
+          reads REVISION_INFORMATION.lastUpdatedOn for the organisationId. Note: this GET endpoint
+          only accepts organisationId — the person new-account check (which would also read the
+          person's REVISION_INFORMATION) is only performed during the validate flow where personId
+          is available.
+
+        - `submitted=true, updatedRecently=true, editable=false`: BANK_DETAILS.status = `SUBMITTED`
+          AND BANK_DETAILS.lastUpdatedOn is within the last 14 days.
+
+        - `editable=true`: None of the above conditions apply.
+
+        - If no BANK_DETAILS record exists for the organisationId, only the new-account check
+          applies (submitted and updatedRecently remain false).
+
+        **JSON field name note**: The Java field `newAccount` serialises as the JSON key `"new"`
+        due to `@JsonProperty("new")` on `AccountStatusResponse`. The schema property name is
+        `new` to match the actual wire format.
+
+        **Source**: `AccountStatusValidationService.java`
+          Constants: LAST_UPDATED_ON_EXPIRED_IN_DAYS = 14, CREATED_ON_VALIDATION_IN_HOURS = 24
+      parameters:
+        - name: organisationId
+          in: path
+          required: true
+          description: |
+            Internal organisation identifier. Must be a numeric string parseable as Long.
+            Non-numeric values cause HTTP 500.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Account status evaluated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountStatusResponse'
+              examples:
+                editable:
+                  summary: Account is editable
+                  value:
+                    editable: true
+                    submitted: false
+                    updatedRecently: false
+                    new: false
+                recentlySubmitted:
+                  summary: Submitted within 14 days — not editable
+                  value:
+                    editable: false
+                    submitted: true
+                    updatedRecently: true
+                    new: false
+                newAccount:
+                  summary: Organisation created within 24 hours — not editable
+                  value:
+                    editable: false
+                    submitted: false
+                    updatedRecently: false
+                    new: true
+        '500':
+          description: Unexpected service error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountStatusResponse'
+              examples:
+                error:
+                  value:
+                    errors:
+                      - code: 500
+                        description: Internal Server Error
+
+components:
+  schemas:
+    ValidationRequest:
+      type: object
+      x-validation-source: ValidationRequest.java
+      description: |
+        Request body for the validate endpoint. No JSR-303 annotations are present on this DTO.
+        All validation is performed by BankChangesValidatorService. organisationId and personId
+        are used to look up BANK_DETAILS, PERSON_BANK_DETAILS, and REVISION_INFORMATION before
+        any downstream call.
+      properties:
+        organisationId:
+          type: string
+          description: Internal organisation ID (numeric string). Passed to Long.valueOf() — must be numeric.
+        personId:
+          type: string
+          description: |
+            Internal person ID (numeric string). Optional but strongly recommended. If absent,
+            the new-account check only evaluates the organisation creation time.
+        account:
+          $ref: '#/components/schemas/AccountDetails'
+        country:
+          $ref: '#/components/schemas/CountryDetails'
+
+    SubmissionRequest:
+      type: object
+      x-validation-source: SubmissionRequest.java, MandatoryFieldsValidator.java
+      description: |
+        Request body for the submit endpoint. No JSR-303 annotations on the DTO; all validation
+        is performed by MandatoryFieldsValidator before Azure Service Bus dispatch. A missing or
+        blank required field causes HTTP 400. The error description is a comma-separated list of
+        missing field names followed by " is missing" (e.g. "SBI, FRN is missing").
+      required:
+        - organisationId
+        - personId
+        - sbi
+        - frn
+        - crn
+        - submissionDateTime
+        - account
+      properties:
+        organisationId:
+          type: string
+          description: Internal organisation ID. Must not be blank.
+        personId:
+          type: string
+          description: Internal person ID. Must not be blank.
+        sbi:
+          type: string
+          description: Single Business Identifier. Must not be blank.
+        frn:
+          type: string
+          description: Firm Reference Number. Must not be blank.
+        crn:
+          type: string
+          description: Customer Reference Number. Must not be blank.
+        submissionDateTime:
+          type: string
+          description: |
+            Submission date/time string. Must not be blank. Expected format: dd/MM/yyyy HH:mm:ss.
+            No formal date parsing is applied — the value is passed as-is to the Azure Service Bus
+            message payload.
+          example: '01/02/2023 14:12:11'
+        account:
+          $ref: '#/components/schemas/SubmissionAccountDetails'
+        country:
+          $ref: '#/components/schemas/CountryDetails'
+
+    AccountDetails:
+      type: object
+      x-validation-source: AccountDetails.java
+      description: |
+        Bank account details used in validation requests and responses. No JSR-303 annotations
+        present on this DTO. For UK accounts: provide number + bank.sortCode. For
+        EU/international accounts: provide iban + bank.swiftCode. On submission (via
+        SubmissionAccountDetails), at least one of number or iban must be non-blank.
+      properties:
+        accountType:
+          type: string
+          description: Account classification.
+          enum:
+            - EU
+            - UK_PERSONAL
+            - UK_BUSINESS
+        name:
+          type: string
+          description: Full account holder name as it appears on the bank account.
+        number:
+          type: string
+          description: UK account number (typically 8 digits).
+        iban:
+          type: string
+          description: International Bank Account Number for EU/international accounts.
+        buildingSocietyRollNumber:
+          type: string
+          description: |
+            Building society roll number. Intended for UK building society accounts only.
+            **Note**: No server-side validation restricts this field to building society
+            account types — the value is accepted and passed through for any account type.
+        bank:
+          $ref: '#/components/schemas/BankDetails'
+
+    SubmissionAccountDetails:
+      type: object
+      x-validation-source: MandatoryFieldsValidator.java
+      description: |
+        Account details for the submit endpoint. Mandatory-field constraints enforced by
+        MandatoryFieldsValidator (not JSR-303):
+        - accountType: must not be null
+        - name: must not be blank
+        - number OR iban: at least one must be non-blank
+        - bank: must not be null
+        - bank.name: must not be blank
+      required:
+        - accountType
+        - name
+        - bank
+      properties:
+        accountType:
+          type: string
+          enum:
+            - EU
+            - UK_PERSONAL
+            - UK_BUSINESS
+          description: Account type. Must not be null.
+        name:
+          type: string
+          description: Full account holder name. Must not be blank.
+        number:
+          type: string
+          description: UK account number. At least one of number or iban must be non-blank.
+        iban:
+          type: string
+          description: IBAN for EU/international accounts. At least one of iban or number must be non-blank.
+        buildingSocietyRollNumber:
+          type: string
+          description: |
+            Optional building society roll number. Intended for UK building society accounts.
+            **Note**: No server-side validation restricts this field to building society
+            account types — the value is accepted and passed through for any account type.
+        bank:
+          $ref: '#/components/schemas/SubmissionBankDetails'
+
+    BankDetails:
+      type: object
+      x-validation-source: BankDetails.java
+      description: Bank details used in validation requests. No JSR-303 annotations present.
+      properties:
+        name:
+          type: string
+          description: Bank name.
+        sortCode:
+          type: string
+          description: UK 6-digit sort code (digits only, no dashes). Required for UK_PERSONAL and UK_BUSINESS account types.
+        swiftCode:
+          type: string
+          description: SWIFT/BIC code. Required for EU account type.
+
+    SubmissionBankDetails:
+      type: object
+      x-validation-source: MandatoryFieldsValidator.java
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Bank name. Must not be blank — enforced by MandatoryFieldsValidator.
+        sortCode:
+          type: string
+          description: UK 6-digit sort code. Optional at submission but required for UK_PERSONAL/UK_BUSINESS downstream processing.
+        swiftCode:
+          type: string
+          description: SWIFT/BIC code. Optional at submission but required for EU account type downstream processing.
+
+    CountryDetails:
+      type: object
+      x-validation-source: CountryDetails.java
+      description: Country and currency for the bank account. No validation annotations present.
+      properties:
+        code:
+          type: string
+          description: |
+            Country code string. Use the keys returned by GET /bank-change-service/v1/country-codes.
+            No format constraint enforced by this service.
+        currency:
+          type: string
+          description: Currency code.
+          enum:
+            - EUR
+            - GBP
+
+    ValidationResponse:
+      type: object
+      x-validation-source: ValidationResponse.java
+      description: |
+        Response from the validate endpoint. Always returned with HTTP 200. `status` values:
+        - `MATCH`: LexisNexis accepted — full match.
+        - `PARTIAL_MATCH`: LexisNexis accepted — partial match.
+        - `FAILED`: A pre-check failed (locked, new account, recently submitted) OR LexisNexis
+          rejected the details. LexisNexis is not called when a pre-check fails.
+      properties:
+        status:
+          type: string
+          description: Validation outcome.
+          enum:
+            - MATCH
+            - PARTIAL_MATCH
+            - FAILED
+        message:
+          type: string
+          description: Human-readable message from LexisNexis. Absent on pre-check failures.
+        attemptsRemaining:
+          type: integer
+          description: |
+            Remaining validation attempts before the account is locked (maximum 3).
+            Calculated as MAX_ALLOWED_ATTEMPTS - PERSON_BANK_DETAILS.updateAttempts.
+            Returns 2 on the first call when no existing record is found.
+            Capped at 0 when updateAttempts exceeds MAX_ALLOWED_ATTEMPTS.
+        account:
+          $ref: '#/components/schemas/AccountDetails'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    AccountStatusResponse:
+      type: object
+      x-validation-source: AccountStatusResponse.java, AccountStatusValidationService.java
+      description: |
+        Response from the account-status endpoint. Important: the Java field `newAccount`
+        serialises as the JSON key `"new"` due to `@JsonProperty("new")`. This schema uses
+        `new` to match the actual wire format.
+      properties:
+        editable:
+          type: boolean
+          description: |
+            True if the bank details may be changed. False when new=true or
+            (submitted=true AND updatedRecently=true).
+        submitted:
+          type: boolean
+          description: True if BANK_DETAILS.status = SUBMITTED and lastUpdatedOn is within the last 14 days.
+        updatedRecently:
+          type: boolean
+          description: True if BANK_DETAILS.lastUpdatedOn is within the last 14 days.
+        new:
+          type: boolean
+          description: |
+            True if the organisation (or person, in the validate flow) was created within the last
+            24 hours. JSON key is "new" (not "newAccount") — @JsonProperty("new").
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    LockedStatusResponse:
+      type: object
+      x-validation-source: LockedStatusResponse.java, LockedStatusValidationService.java
+      description: |
+        Response from the locked-status endpoint. If no PERSON_BANK_DETAILS record exists for
+        the given combination, the response is an empty JSON object `{}` (locked is a Java boolean
+        primitive defaulting to false; omitted by @JsonInclude.NON_EMPTY).
+      properties:
+        locked:
+          type: boolean
+          description: |
+            True if PERSON_BANK_DETAILS.updateAttempts >= 3 AND lastUpdatedOn is within the last
+            24 hours. Omitted from JSON when false due to @JsonInclude.NON_EMPTY.
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    ExistingAccountsResponse:
+      type: object
+      x-validation-source: ExistingAccountsResponse.java
+      properties:
+        accounts:
+          type: array
+          description: List of existing bank accounts from DAX. Each entry has the last 4 digits and currency.
+          items:
+            $ref: '#/components/schemas/Account'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    Account:
+      type: object
+      x-validation-source: Account.java
+      description: A single existing bank account entry from DAX.
+      properties:
+        number:
+          type: string
+          description: Last 4 digits of the bank account number.
+        currency:
+          type: string
+          description: Currency code for this account.
+          enum:
+            - EUR
+            - GBP
+
+    CountriesCurrencyResponse:
+      type: object
+      x-validation-source: CountriesCurrencyResponse.java
+      properties:
+        countriesCurrency:
+          type: object
+          description: |
+            Map of country code to currency code string. Values are sourced dynamically from
+            LexisNexis and cached. The country code format depends on the LexisNexis response;
+            controller examples show ISO 3166-1 alpha-2 (GB, IE).
+          additionalProperties:
+            type: string
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    DefaultResponse:
+      type: object
+      x-validation-source: DefaultResponse.java
+      description: |
+        Generic response for the submit endpoint. On success the response is an empty JSON object
+        (all fields omitted by @JsonInclude.NON_EMPTY). On error, the errors array is populated.
+      properties:
+        id:
+          type: string
+          description: Optional identifier (e.g. Azure Service Bus message ID) returned on success.
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResponseError'
+
+    ResponseError:
+      type: object
+      x-validation-source: ResponseError.java, ResponseErrorCodes.java
+      description: An error entry in a response errors array.
+      properties:
+        code:
+          type: integer
+          description: |
+            Error code. Can be an HTTP status code or an application-specific code from
+            `ResponseErrorCodes`:
+            - `10` — VALIDATION_ERROR (pre-check or business rule failure)
+            - `20` — SUBMISSION_ERROR (Azure Service Bus send failure)
+            - `400` — HTTP 400 (mandatory field validation failure)
+            - `500` — HTTP 500 (unexpected internal error)
+        description:
+          type: string
+          description: |
+            Human-readable error description. For MandatoryFieldsValidator failures this is a
+            comma-separated list of missing field names (no spaces) followed by " is missing"
+            (e.g. "SBI,FRN is missing").

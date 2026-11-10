@@ -1,0 +1,1089 @@
+openapi: '3.0.1'
+info:
+  title: CAPD Internal User Auth Service
+  version: v1
+  x-source-repository: capd-internal-user-auth-services
+  description: |
+    Spring Boot / JAX-RS (Jersey) service managing internal CAPD portal user accounts,
+    authentication, password lifecycle, session persistence, and token management.
+
+    **Database schema**: `CAPD_AUTH` (Oracle)
+    - `CAPD_USER` — internal user accounts
+    - `CAPD_USER_TOKEN` — email verification / password reset tokens
+    - `CAPD_PENDING_INTERNAL_USER` — users invited but not yet activated
+    - `INTERNAL_USER_SESSION` — internal user session records
+
+    **Authentication**: No formal auth scheme. `callerId` header used for access control
+    on some endpoints (see individual endpoint descriptions).
+
+    **Key business rules**:
+    - `POST /internal-user/create` is restricted to two configured `callerId` values
+      (`internalUserLoad.callerId`, `capService.callerId`). Any other → 403.
+    - Email uniqueness is checked across BOTH `CAPD_USER` and `CAPD_PENDING_INTERNAL_USER`.
+    - Password complexity: trimmed length ≥ 8; at least 3 of {lowercase, uppercase, digit,
+      special character} character classes required.
+    - User locking: `failedLoginAttempts > maxFailedLoginAttempts` (configurable).
+    - Password expiry: `lastPasswordChange < (now - passwordExpirationTimeInDays)`. System
+      users (listed in `SYSTEM_INTERNAL_USER` entity) are exempt.
+    - Token `type`/`value` must match `^[a-zA-Z0-9_-]*$` (but null/blank passes the regex).
+    - `PUT /internal-user/{email}/locked` only supports **unlocking** (`locked=false`);
+      sending `locked=true` returns HTTP 400.
+    - `POST /user-session/persist-session` uses `callerId` from the **request body**, not
+      the `callerId` header.
+    - `PUT /user-session` returns HTTP 412 if a session already exists for the `callerId`.
+
+servers:
+  - url: http://localhost:8080
+    description: Local Spring Boot development server
+
+tags:
+  - name: status
+    description: Application health check
+  - name: internal-user
+    description: Internal user account lifecycle (create, activate, password, lock)
+  - name: user
+    description: Direct user CRUD and authentication
+  - name: userToken
+    description: Email verification / password reset token management
+  - name: user-session
+    description: Internal user session persistence
+
+paths:
+  /status:
+    get:
+      tags:
+        - status
+      summary: Application health check
+      operationId: getStatus
+      description: Returns plain text with service name and version (from `version.txt`).
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /internal-user/create:
+    post:
+      tags:
+        - internal-user
+      summary: Create (invite) an internal user
+      operationId: create
+      description: |
+        Invites a new internal user by:
+        1. Validating the `callerId` header against two authorised system IDs.
+        2. Checking email uniqueness across `CAPD_USER` AND `CAPD_PENDING_INTERNAL_USER`.
+        3. Calling downstream `capdPersonClient.createInternalPerson()` to provision the CAPD
+           person record.
+        4. Saving a `PendingInternalUser` record.
+        5. Creating an `EMAIL_VERIFICATION` token (UUID v4, `expires=now`).
+        6. Sending an activation email.
+
+        **Always returns HTTP 200** — errors are indicated by `InternalUserCreateResponse.code`:
+        - `OK` (0) — success
+        - `ERROR_DUPLICATE_EMAIL` — email exists in CAPD_USER or CAPD_PENDING_INTERNAL_USER
+        - `ERROR_INVALID_EMAIL` — downstream returned an invalid email response
+        - `ERROR` — email send failure or any other upstream error
+
+        **HTTP 403**: callerId header missing OR not one of the two authorised system IDs.
+      parameters:
+        - name: callerId
+          in: header
+          required: false
+          description: |
+            Effectively required. Must be one of two configured system caller IDs
+            (`internalUserLoad.callerId` or `capService.callerId`). Any other value → 403.
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CapdInternalUserCreateRequest'
+      responses:
+        '200':
+          description: |
+            Request processed. Check `code` field for outcome. `personId` is 0 on any error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalUserCreateResponse'
+        '403':
+          description: callerId missing or not authorised to create internal users
+
+  /internal-user/{email}:
+    put:
+      tags:
+        - internal-user
+      summary: Activate an internal user account
+      operationId: activate
+      description: |
+        Completes the activation of a pending internal user whose email was verified.
+
+        **Validation**:
+        - `email` must exist in `CAPD_PENDING_INTERNAL_USER` → `ElementNotFoundException`
+          (unhandled; propagates as HTTP 500).
+
+        **Transaction**: Atomic — saves user, deletes EMAIL_VERIFICATION tokens for email,
+        deletes the `PendingInternalUser` record.
+
+        **Note**: Password stored as plaintext at this step. The user should immediately
+        change their password via `PUT /internal-user/{email}/password`.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: Email address of the pending user to activate
+          schema:
+            type: string
+            format: email
+            maxLength: 60
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CapdInternalUserActivationRequest'
+      responses:
+        '200':
+          description: User activated successfully
+        '500':
+          description: User not found in CAPD_PENDING_INTERNAL_USER (ElementNotFoundException unhandled)
+
+  /internal-user/{email}/password:
+    put:
+      tags:
+        - internal-user
+      summary: Change internal user password (consumes PASSWORD_RESET token)
+      operationId: changePassword
+      description: |
+        Sets a new password for the user identified by `email`. Requires an existing
+        `PASSWORD_RESET` token for the email address.
+
+        **Business logic**:
+        1. Fetch `PASSWORD_RESET` tokens ordered by `created DESC` → throws
+           `ElementNotFoundException` if none exist (unhandled → HTTP 500).
+        2. Fetch user by email → throws `ElementNotFoundException` if not found (unhandled → HTTP 500).
+        3. Updates: `active=true`, `lastPasswordChange=now`, `password=bcrypt(password)`,
+           `expirePasswordEmailSent=false`.
+        4. Deletes ALL `PASSWORD_RESET` tokens for the email (token consumed).
+
+        **Password is bcrypt-hashed before storage in `CAPD_USER.passwd`.**
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: Email address of the user changing password
+          schema:
+            type: string
+            format: email
+            maxLength: 60
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CapdPasswordChangeRequest'
+      responses:
+        '200':
+          description: Password changed successfully
+        '500':
+          description: User not found or no PASSWORD_RESET token exists (unhandled exceptions)
+
+  /internal-user/{callerId}/password:
+    delete:
+      tags:
+        - internal-user
+      summary: Initiate password reset by callerId
+      operationId: resetPassword
+      description: |
+        Creates a `PASSWORD_RESET` token and sends a password reset email to the internal
+        user associated with `callerId`. Resolves the user's email by calling an internal
+        CAPD services client with `callerId`.
+
+        **Token expiry**: `token.passwordResetExpirationTimeInMinutes` from now (configurable).
+
+        **HTTP 500**: User not found, email send failure, or any `ServiceLayerException`.
+      parameters:
+        - name: callerId
+          in: path
+          required: true
+          description: Internal CAPD caller ID (BigInteger)
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Password reset email sent
+        '500':
+          description: ServiceLayerException (user not found, email failure, etc.)
+
+  /internal-user/{personId}/password-for-person:
+    delete:
+      tags:
+        - internal-user
+      summary: Initiate password reset by personId
+      operationId: resetPasswordForPerson
+      description: |
+        Same as `DELETE /internal-user/{callerId}/password` but uses `personId` as the
+        identifier. Uses `ResetPasswordForPersonMailServiceImpl` for the email. Token type
+        and expiry rules are the same.
+      parameters:
+        - name: personId
+          in: path
+          required: true
+          description: Internal CAPD person ID (BigInteger)
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Password reset email sent
+        '500':
+          description: ServiceLayerException (user not found, email failure, etc.)
+
+  /internal-user/deactivate:
+    post:
+      tags:
+        - internal-user
+      summary: Deactivate internal user accounts in batch
+      operationId: deactivateInternalUsers
+      description: |
+        Deactivates each email address in `users` list. Per-user in own transaction:
+        - Found: sets `active=false`, `failedLoginAttempts=0` → `SUCCESS`
+        - Not found: → `USER_NOT_FOUND`
+
+        **Always returns HTTP 200** with per-user results map. HTTP-level errors are not
+        used for business failures.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalUsersRequest'
+      responses:
+        '200':
+          description: Batch deactivation results (one entry per email in request)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalUsersResponse'
+
+  /internal-user/reactivate:
+    post:
+      tags:
+        - internal-user
+      summary: Initiate reactivation for internal user accounts in batch
+      operationId: startInternalUsersReactivation
+      description: |
+        For each email in `users` list, validates the email, checks the user exists, checks
+        they're not already active, creates a `PASSWORD_RESET` token, and sends a reactivation
+        email. Per-user errors are captured in the results map (not HTTP 500).
+
+        **Result statuses per user**:
+        - `SUCCESS` — reactivation email sent
+        - `USER_NOT_FOUND` — email not in `CAPD_USER`
+        - `INVALID_EMAIL_FORMAT` — email failed downstream validation
+        - `USER_ALREADY_ACTIVE` — user is already active
+        - `UNEXPECTED_ERROR` — any other exception
+
+        **Token expiry**: `token.reactivatingUserExpirationTimeInMinutes` from now.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalUsersRequest'
+      responses:
+        '200':
+          description: Batch reactivation results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalUsersResponse'
+
+  /internal-user/validatePassword:
+    post:
+      tags:
+        - internal-user
+      summary: Validate password complexity and policy
+      operationId: validatePassword
+      description: |
+        Validates a password against complexity rules and optionally against the last 3
+        stored passwords for the user.
+
+        **Validation rules** (in order):
+        1. `password.trim().length() >= 8` → else `INVALID_COMPLEXITY`
+        2. At least 3 of 4 character classes present: lowercase (`\p{Lower}`), uppercase
+           (`\p{Upper}`), digit (`\p{Digit}`), special character (`\p{Punct}`) → else
+           `INVALID_COMPLEXITY`
+        3. `password.trim().equals(email.trim())` → `INVALID_SAME_AS_USERNAME`
+        4. If `checkAgainstLastUserPasswords=true`: look up user by email; compare against
+           last 3 bcrypt hashes (`CAPD_USER.passwd` history) → `INVALID_SAME_AS_PREVIOUS`
+        5. Otherwise → `OK`
+
+        **Returns**: `PasswordValidationResult` enum value as JSON string.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CapdInternalUserPasswordComplexityRequest'
+      responses:
+        '200':
+          description: Password validation result
+          content:
+            application/json:
+              schema:
+                type: string
+                enum:
+                  - OK
+                  - INVALID_COMPLEXITY
+                  - INVALID_SAME_AS_PREVIOUS
+                  - INVALID_SAME_AS_USERNAME
+
+  /internal-user/{email}/locked:
+    put:
+      tags:
+        - internal-user
+      summary: Unlock an internal user account
+      operationId: changeLockedStatus
+      description: |
+        Unlocks a user account by resetting `failedLoginAttempts=0`. Only supports
+        **unlocking** (`locked=false`). Sending `locked=true` returns HTTP 400 immediately.
+
+        **Validation**:
+        - `locked == true` → HTTP 400 immediately (locking via this endpoint is not supported)
+        - user not found by email → HTTP 404
+
+        **Note**: Request body is a raw JSON boolean, not an object.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: Email address of the user to unlock
+          schema:
+            type: string
+            format: email
+            maxLength: 60
+      requestBody:
+        required: true
+        description: |
+          Raw boolean. Must be `false` to unlock. `true` returns HTTP 400.
+        content:
+          application/json:
+            schema:
+              type: boolean
+      responses:
+        '200':
+          description: User unlocked (failedLoginAttempts reset to 0)
+        '400':
+          description: Request body is `true` — locking is not supported via this endpoint
+        '404':
+          description: User not found by email in CAPD_USER
+
+  /internal-user/locked:
+    get:
+      tags:
+        - internal-user
+      summary: Get all locked internal users
+      operationId: getLockedUsers
+      description: |
+        Returns all users where `CAPD_USER.failedLoginAttempts > maxFailedLoginAttempts`
+        (configurable via `login.maxFailedLoginAttempts`).
+      responses:
+        '200':
+          description: List of locked users
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/LockedInternalUserResponse'
+
+  /user:
+    get:
+      tags:
+        - user
+      summary: Find a user by email address
+      operationId: findByEmail
+      description: |
+        Looks up a user by email in `CAPD_USER`. Returns the full `User` entity including
+        the bcrypt-hashed password field.
+
+        **Validation**:
+        - `email` param null → HTTP 400
+        - Email fails `org.apache.commons.validator.routines.EmailValidator` → HTTP 400
+        - User not found in `CAPD_USER` → HTTP 404
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: email
+          in: query
+          required: true
+          description: Email address to look up (Apache Commons EmailValidator applied)
+          schema:
+            type: string
+            format: email
+            maxLength: 60
+      responses:
+        '200':
+          description: User found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          description: Email is null or fails format validation
+        '404':
+          description: User not found in CAPD_USER
+
+    put:
+      tags:
+        - user
+      summary: Create a user record (PUT/insert)
+      operationId: create_user
+      description: |
+        Creates a new `User` record in `CAPD_USER` via JPA merge/insert.
+
+        **Validation**:
+        - `user.id != null` AND record already exists in `CAPD_USER` → HTTP 409
+
+        If `user.id` is null, JPA sequence generates a new ID.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/User'
+      responses:
+        '200':
+          description: User created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '409':
+          description: User already exists (id provided and record found)
+
+    post:
+      tags:
+        - user
+      summary: Update an existing user record (POST/update)
+      operationId: update_user
+      description: |
+        Updates an existing `User` record in `CAPD_USER` via JPA save.
+
+        **Validation**:
+        - `user.id == null` → HTTP 404
+        - Record not found in `CAPD_USER` by id → HTTP 404
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/User'
+      responses:
+        '200':
+          description: User updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '404':
+          description: User id is null or record not found
+
+  /user/{email}/authentication-attempt:
+    post:
+      tags:
+        - user
+      summary: Authenticate a user (verify credentials)
+      operationId: createAuthenticationAttempt
+      description: |
+        Validates email/password credentials and returns account status. Manages
+        `failedLoginAttempts` counter. Does NOT create a session — session management
+        is handled separately.
+
+        **Pending users**: If email is found in `CAPD_PENDING_INTERNAL_USER`, returns
+        `UNVERIFIED` status immediately (no password check).
+
+        **Status determination** (`UserAccountInfo.status`):
+        - `LOCKED`: `failedLoginAttempts > maxFailedLoginAttempts`
+        - `PASSWORD_EXPIRED`: `lastPasswordChange < (now - passwordExpirationTimeInDays)`
+          AND user is NOT a system user (in `SYSTEM_INTERNAL_USER` entity)
+        - `INACTIVE`: `!user.isActive()`
+        - `OK`: all checks pass
+
+        **HTTP 404 on failed auth** (unless account becomes locked):
+        - Wrong password AND `failedLoginAttempts` still below threshold: save incremented
+          counter → return 404 (do not reveal status)
+
+        **HTTP 200 on lock** (password wrong and account now locked):
+        - Save incremented counter → return 200 with `LOCKED` status
+
+        **HTTP 200 on success** (password correct, not locked):
+        - Reset `failedLoginAttempts=0` → return 200 with actual status (may be
+          `PASSWORD_EXPIRED`, `INACTIVE`, or `OK`)
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: email
+          in: path
+          required: true
+          description: Email address of the user attempting to authenticate
+          schema:
+            type: string
+            format: email
+            maxLength: 60
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthenticationAttemptRequest'
+      responses:
+        '200':
+          description: |
+            Credentials accepted OR account now locked. Check `status` field.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserAccountInfo'
+        '404':
+          description: User not found OR wrong password AND account not yet locked
+
+  /userToken:
+    get:
+      tags:
+        - userToken
+      summary: Find a user token by type and token value or target user
+      operationId: findByTypeAndEitherTokenOrUser
+      description: |
+        Retrieves a `UserToken` by type plus either token value OR target user (email).
+        Exactly one of `token` or `targetUser` must be provided.
+
+        **Validation** (all → HTTP 400):
+        1. `type` is empty or does not match `^[a-zA-Z0-9_-]*$`
+        2. Both `token` and `targetUser` are null
+        3. Both `token` and `targetUser` are provided
+        4. `token` is provided but empty or does not match `^[a-zA-Z0-9_-]*$`
+
+        **Note**: `targetUser` is not validated against the regex.
+
+        **Token type values**: `EMAIL_VERIFICATION`, `PASSWORD_RESET`
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: type
+          in: query
+          required: true
+          description: |
+            Token type. Must match `^[a-zA-Z0-9_-]*$`. Known values: EMAIL_VERIFICATION,
+            PASSWORD_RESET. Max 20 characters (CAPD_USER_TOKEN.type column).
+          schema:
+            type: string
+            maxLength: 20
+            pattern: '^[a-zA-Z0-9_-]*$'
+        - name: token
+          in: query
+          required: false
+          description: |
+            Token value. Mutually exclusive with `targetUser`. Must match
+            `^[a-zA-Z0-9_-]*$`. Max 40 characters (CAPD_USER_TOKEN.token column).
+          schema:
+            type: string
+            maxLength: 40
+            pattern: '^[a-zA-Z0-9_-]*$'
+        - name: targetUser
+          in: query
+          required: false
+          description: |
+            Target user email address. Mutually exclusive with `token`.
+            Max 60 characters (CAPD_USER_TOKEN.targetuser column).
+          schema:
+            type: string
+            maxLength: 60
+      responses:
+        '200':
+          description: Token found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserToken'
+        '400':
+          description: Validation failure (type missing/invalid, both or neither token/targetUser)
+        '404':
+          description: No matching token found in CAPD_USER_TOKEN
+
+    put:
+      tags:
+        - userToken
+      summary: Create a user token (PUT/insert)
+      operationId: create_userToken
+      description: |
+        Creates a new `UserToken` record in `CAPD_USER_TOKEN`.
+
+        **Validation**: `userToken.id != null` AND record exists → HTTP 409.
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserToken'
+      responses:
+        '200':
+          description: Token created
+        '409':
+          description: Token already exists
+
+    delete:
+      tags:
+        - userToken
+      summary: Delete tokens by type and target user
+      operationId: deleteByUser
+      description: |
+        Deletes all tokens in `CAPD_USER_TOKEN` matching the `type` and `targetUser`.
+
+        **Validation** (→ HTTP 400):
+        - `type` empty or does not match `^[a-zA-Z0-9_-]*$`
+        - `targetUser` null or empty
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+        - name: type
+          in: query
+          required: true
+          description: Token type. Must match `^[a-zA-Z0-9_-]*$`
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9_-]*$'
+        - name: targetUser
+          in: query
+          required: true
+          description: Email address (targetuser column in CAPD_USER_TOKEN)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Tokens deleted
+        '400':
+          description: type invalid or targetUser missing
+
+  /user-session:
+    get:
+      tags:
+        - user-session
+      summary: Check if a session exists in the database
+      operationId: userSessionExists
+      description: |
+        Looks up `INTERNAL_USER_SESSION` by `callerId` header. Returns the session record
+        if found, or `NO_SESSION` status if not.
+
+        **HTTP 400**: `callerId` header is null.
+      parameters:
+        - name: callerId
+          in: header
+          required: true
+          description: |
+            Effectively required. Returns 400 if null. Used as the lookup key in
+            INTERNAL_USER_SESSION.caller_id.
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Session status returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersistUserSessionResponse'
+        '400':
+          description: callerId header is missing
+
+    delete:
+      tags:
+        - user-session
+      summary: Delete a session from the database
+      operationId: deleteUserSession
+      description: |
+        Deletes a `INTERNAL_USER_SESSION` record by `callerId` header.
+
+        **HTTP 400**: `callerId` header is null.
+        **HTTP 404**: No session found for `callerId`.
+      parameters:
+        - name: callerId
+          in: header
+          required: true
+          description: The caller ID whose session should be deleted
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Session deleted
+        '400':
+          description: callerId header is missing
+        '404':
+          description: No session found for this callerId
+
+  /user-session/persist-session:
+    post:
+      tags:
+        - user-session
+      summary: Persist a new internal user session
+      operationId: persistUserSession
+      description: |
+        Creates a new session record in `INTERNAL_USER_SESSION`. The `callerId` used as
+        the session key comes from the **request body** (`PersistUserSessionRequest.callerId`),
+        NOT from the `callerId` header.
+
+        **HTTP 412** (Precondition Failed): A session already exists in `INTERNAL_USER_SESSION`
+        for `sessionRequest.callerId`. The caller must delete the existing session before
+        creating a new one.
+
+        **On success**: Returns `PersistUserSessionResponse` with `sessionStatus=EXISTING_SESSION`
+        (confusingly named — means the session that was just created now exists).
+      parameters:
+        - $ref: '#/components/parameters/callerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersistUserSessionRequest'
+      responses:
+        '200':
+          description: Session persisted. `sessionStatus=EXISTING_SESSION` in response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersistUserSessionResponse'
+        '412':
+          description: Session already exists for this callerId
+
+components:
+  parameters:
+    callerId:
+      name: callerId
+      in: header
+      required: false
+      description: Internal CAPD caller identifier (BigInteger). Used for logging or access control.
+      schema:
+        type: integer
+
+  schemas:
+    CapdInternalUserCreateRequest:
+      type: object
+      x-validation-source: CapdInternalUserCreateRequest.java (API jar — source not in workspace)
+      x-schema-incomplete: true
+      description: Request to invite a new internal user.
+      properties:
+        firstName:
+          type: string
+          description: User's first name. Stored in CAPD_PENDING_INTERNAL_USER.firstname (max 40)
+          maxLength: 40
+        lastName:
+          type: string
+          description: User's last name. Stored in CAPD_PENDING_INTERNAL_USER.lastname (max 40)
+          maxLength: 40
+        email:
+          type: string
+          format: email
+          description: User's email. Checked for uniqueness. Max 60 (CAPD_USER.email / CAPD_PENDING_INTERNAL_USER.email)
+          maxLength: 60
+        domain:
+          type: string
+          description: Active Directory domain. Stored in CAPD_PENDING_INTERNAL_USER.domain (max 50)
+          maxLength: 50
+        username:
+          type: string
+          description: AD username. Stored in CAPD_PENDING_INTERNAL_USER.username (max 50)
+          maxLength: 50
+        privileges:
+          type: array
+          description: List of privilege strings forwarded to capdPersonClient.createInternalPerson()
+          items:
+            type: string
+
+    InternalUserCreateResponse:
+      type: object
+      x-validation-source: InternalUserCreateResponse.java (API jar)
+      x-schema-incomplete: true
+      description: |
+        Result of a create-user request. HTTP status is always 200 — check `code` field.
+      properties:
+        message:
+          type: string
+          description: Human-readable result message
+        error:
+          type: string
+          description: Error details if code is not OK. readOnly.
+        code:
+          type: integer
+          description: |
+            Result code. 0=OK, negative=error. Known error values:
+            ERROR_DUPLICATE_EMAIL, ERROR_INVALID_EMAIL, ERROR — check source constants.
+        personId:
+          type: integer
+          description: New person's CAPD ID on success; 0 on error (BigInteger)
+
+    CapdInternalUserActivationRequest:
+      type: object
+      x-validation-source: CapdInternalUserActivationRequest.java (API jar)
+      description: Activation request carrying the initial password.
+      properties:
+        password:
+          type: string
+          description: |
+            Initial password (plaintext). Stored as-is during activation (not hashed at
+            this step). Must be changed via PUT /internal-user/{email}/password to trigger bcrypt.
+
+    CapdPasswordChangeRequest:
+      type: object
+      x-validation-source: CapdPasswordChangeRequest.java (API jar)
+      description: Request to change password after consuming a PASSWORD_RESET token.
+      properties:
+        password:
+          type: string
+          description: New plaintext password. bcrypt-hashed before storage in CAPD_USER.passwd.
+
+    InternalUsersRequest:
+      type: object
+      x-validation-source: InternalUsersRequest.java (API jar)
+      description: List of email addresses for batch operations.
+      properties:
+        users:
+          type: array
+          items:
+            type: string
+            format: email
+
+    InternalUsersResponse:
+      type: object
+      x-validation-source: InternalUsersResponse.java (API jar)
+      description: Per-user results map for batch operations.
+      properties:
+        results:
+          type: object
+          description: |
+            Map of email → status. Status values: SUCCESS, USER_NOT_FOUND,
+            INVALID_EMAIL_FORMAT, USER_ALREADY_ACTIVE, UNEXPECTED_ERROR.
+          additionalProperties:
+            type: string
+            enum:
+              - SUCCESS
+              - USER_NOT_FOUND
+              - INVALID_EMAIL_FORMAT
+              - USER_ALREADY_ACTIVE
+              - UNEXPECTED_ERROR
+
+    CapdInternalUserPasswordComplexityRequest:
+      type: object
+      x-validation-source: CapdInternalUserPasswordComplexityRequest.java (API jar)
+      description: Password complexity validation request.
+      properties:
+        email:
+          type: string
+          description: |
+            Email address. Used to check password ≠ email (trimmed string comparison).
+            If checkAgainstLastUserPasswords=true, also used to look up the user's
+            stored password hashes.
+        password:
+          type: string
+          description: Plaintext password to validate
+        checkAgainstLastUserPasswords:
+          type: boolean
+          description: |
+            If true, the password is compared against the last 3 stored bcrypt hashes
+            for the user. If the user does not exist, this check is skipped.
+
+    AuthenticationAttemptRequest:
+      type: object
+      x-validation-source: AuthenticationAttemptRequest.java (API jar)
+      description: Credential authentication request.
+      properties:
+        password:
+          type: string
+          description: Plaintext password to validate against CAPD_USER.passwd (bcrypt)
+
+    UserAccountInfo:
+      type: object
+      x-validation-source: UserAccountInfo.java (API jar)
+      description: |
+        Account information returned after authentication attempt. `status` reflects the
+        account state at the time of the request.
+      properties:
+        id:
+          type: integer
+          description: CAPD_USER.id (null for pending/unverified users)
+        email:
+          type: string
+        firstName:
+          type: string
+          description: For pending users, this is set to the email address (not the actual firstName)
+        lastName:
+          type: string
+        lastLogin:
+          type: string
+          format: date-time
+          description: Timestamp of last successful login. Null for pending users.
+        status:
+          type: string
+          description: |
+            Account status at time of check. Priority order: LOCKED > PASSWORD_EXPIRED >
+            INACTIVE > OK. UNVERIFIED returned when user is in CAPD_PENDING_INTERNAL_USER.
+          enum:
+            - OK
+            - LOCKED
+            - UNVERIFIED
+            - PASSWORD_EXPIRED
+            - INACTIVE
+
+    LockedInternalUserResponse:
+      type: object
+      x-validation-source: LockedInternalUserResponse.java (mapped from User entity)
+      description: Minimal user record for locked-user listing.
+      properties:
+        id:
+          type: integer
+          description: CAPD_USER.id (BigInteger)
+        email:
+          type: string
+          description: CAPD_USER.email
+        firstName:
+          type: string
+          description: CAPD_USER.firstname
+        lastName:
+          type: string
+          description: CAPD_USER.lastname
+
+    User:
+      type: object
+      x-validation-source: User.java (CAPD_AUTH.CAPD_USER entity)
+      description: |
+        Internal user account entity. CAPD_AUTH.CAPD_USER table.
+        WARNING: `password` field contains bcrypt hash — handle with care.
+      properties:
+        id:
+          type: integer
+          description: Primary key (BigInteger, sequence CAPDUSERSEQ)
+        email:
+          type: string
+          description: User email address. UNIQUE. max 60 characters.
+          maxLength: 60
+        password:
+          type: string
+          description: |
+            bcrypt password hash stored in CAPD_USER.passwd. max 60 characters.
+          maxLength: 60
+        firstName:
+          type: string
+          description: First name. CAPD_USER.firstname. max 40 characters.
+          maxLength: 40
+        lastName:
+          type: string
+          description: Last name. CAPD_USER.lastname. max 40 characters.
+          maxLength: 40
+        active:
+          type: boolean
+          description: Account active flag. NOT NULL.
+        emailValidated:
+          type: boolean
+          description: Email verified flag. NOT NULL.
+        lastLogin:
+          type: string
+          format: date-time
+          description: Last login timestamp. Nullable.
+        domain:
+          type: string
+          description: Active Directory domain. Nullable.
+        username:
+          type: string
+          description: Active Directory username. Nullable.
+        lastPasswordChange:
+          type: string
+          format: date-time
+          description: Timestamp of last password change. Nullable.
+        expirePasswordEmailSent:
+          type: boolean
+          description: Flag indicating password expiry email was sent. Nullable.
+        failedLoginAttempts:
+          type: integer
+          description: |
+            Count of consecutive failed login attempts. Nullable (treated as 0 when null).
+            User is locked when this > maxFailedLoginAttempts (configurable).
+
+    UserToken:
+      type: object
+      x-validation-source: UserToken.java (CAPD_AUTH.CAPD_USER_TOKEN entity)
+      description: |
+        Email verification or password reset token. CAPD_AUTH.CAPD_USER_TOKEN table.
+      properties:
+        id:
+          type: integer
+          description: Primary key (BigInteger, sequence CAPDUSERTOKENSEQ)
+        token:
+          type: string
+          description: Token value (UUID v4). max 40 characters. UNIQUE with `type`.
+          maxLength: 40
+        targetUser:
+          type: string
+          description: Email address of the target user. max 60 characters.
+          maxLength: 60
+        type:
+          type: string
+          description: Token type. max 20 characters. UNIQUE with `token`.
+          maxLength: 20
+          enum:
+            - EMAIL_VERIFICATION
+            - PASSWORD_RESET
+        created:
+          type: string
+          format: date-time
+          description: Token creation timestamp. NOT NULL.
+        expires:
+          type: string
+          format: date-time
+          description: Token expiry timestamp. NOT NULL.
+
+    PersistUserSessionRequest:
+      type: object
+      x-validation-source: PersistUserSessionRequest.java (shared API library)
+      description: |
+        Session persistence request. The `callerId` here is used as the primary key in
+        INTERNAL_USER_SESSION — NOT the `callerId` header.
+      properties:
+        callerId:
+          type: integer
+          description: |
+            User's internal CAPD caller ID (BigInteger). Used as INTERNAL_USER_SESSION.caller_id
+            primary key. max 20 digits.
+        capdAccessToken:
+          type: string
+          description: Session token value (UUID). max 255 characters.
+          maxLength: 255
+
+    PersistUserSessionResponse:
+      type: object
+      x-validation-source: PersistUserSessionResponse.java (shared API library)
+      description: |
+        Session lookup / create response.
+      properties:
+        sessionStatus:
+          type: string
+          description: |
+            `EXISTING_SESSION` — session found in DB (or was just created).
+            `NO_SESSION` — no session for this callerId.
+          enum:
+            - EXISTING_SESSION
+            - NO_SESSION
+        callerId:
+          type: integer
+          description: Session callerId (BigInteger). Null if NO_SESSION.
+        capdAccessToken:
+          type: string
+          description: Session token. Null if NO_SESSION.
+        logInTimestamp:
+          type: string
+          format: date-time
+          description: Session creation timestamp. Null if NO_SESSION.

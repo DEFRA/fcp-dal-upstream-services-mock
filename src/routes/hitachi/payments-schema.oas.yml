@@ -1,0 +1,356 @@
+openapi: 3.1.0
+info:
+  title: Payments details API
+  description: API for Payments information and history
+  version: '1.0.0'
+  license:
+    name: 'Open Government Licence v3.0'
+    url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3'
+security:
+  - BearerAuth: []
+servers:
+  - url: 'https://orgcf202fa2.operations.eu.dynamics.com/api'
+    description: The test server for Hitachi payments APIs, a.k.a. FAT 202.
+  - url: 'http://dal-mock:3100/api'
+    description: Local mock server
+tags:
+  - name: 'payments'
+    description: API for Payments information and history
+paths:
+  /services/RSFVendPaymentDetailsServiceGroup/RSFVendPaymentDetailsService/getSupplierPaymentsPackage:
+    post:
+      tags:
+        - 'payments'
+      summary: Get payments data for a business
+      description: >
+        Returns payments info and history for a business identified by the FRN in the request body.
+      operationId: getSupplierPaymentsData
+      requestBody:
+        description: >
+          FRN of the business to retrieve payments data for, and optionally a from AND to date.
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentsRequest'
+      responses:
+        '200':
+          description: >
+            Returns payments data for the specified business, or a skeleton response with metadata.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/PaymentsData'
+                  - $ref: '#/components/schemas/NotFound'
+        '400':
+          description: >
+            Bad request data, usually missing required fields `request`, `request.payment`, `request.audit`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericError'
+        '401':
+          description: Unauthorized - missing or invalid authentication token - empty response body
+        '500':
+          description: >
+            General error case, but can happen for missing required `audit` object in request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericError'
+
+components:
+  schemas:
+    PaymentsRequest:
+      type: object
+      properties:
+        request:
+          type: object
+          properties:
+            payment:
+              type: object
+              properties:
+                SupplierAccount:
+                  description: The FRN of the business (10 digits).
+                  oneOf:
+                    - type: string
+                      minimum: 0
+                    - type: number
+                    - type: boolean
+                    - type: 'null'
+                  examples:
+                    - '9222222222'
+                    - '9791344361'
+                    - '9581665877'
+                    - '9672045241'
+                FromDate:
+                  description: Date(/time) preferably in ISO format - or MM/DD/YYYY format (en-US locale).
+                  type: string
+                  format: date-time
+                  examples:
+                    - '2020-01-01T00:00:00Z'
+                    - '2022-04-06T00:00:00.000Z'
+                ToDate:
+                  description: Date(/time) preferably in ISO format - or MM/DD/YYYY format (en-US locale).
+                  type: string
+                  format: date-time
+                  examples:
+                    - '2021-01-01T00:00:00Z'
+                    - '2023-04-05T23:59:59.999Z'
+            audit:
+              type: object
+              properties:
+                requestedSystem:
+                  description: GUID of the app-reg of the system making the request (SFD, SFI, etc.).
+                  oneOf:
+                    - type: string
+                      minimum: 0
+                      maximum: 128
+                    - type: number
+                    - type: boolean
+                    - type: 'null'
+                requesterId:
+                  description: Email address of the user making the request.
+                  oneOf:
+                    - type: string
+                      minimum: 0
+                      maximum: 254
+                    - type: number
+                    - type: boolean
+                    - type: 'null'
+                userIP:
+                  description: IP address of the user making the request, either IPv4 or IPv6.
+                  oneOf:
+                    - type: string
+                      minimum: 0
+                      maximum: 45
+                    - type: number
+                    - type: boolean
+                    - type: 'null'
+                resourceId:
+                  description: Identifier for the resource being accessed (the SBI of the business).
+                  oneOf:
+                    - type: string
+                      minimum: 0
+                      maximum: 32
+                    - type: number
+                    - type: boolean
+                    - type: 'null'
+                correlationId:
+                  description: >
+                    Correlation identifier for tracing the request.
+                    Generated from the original user's request and passed through each layer/system.
+                  oneOf:
+                    - type: string
+                      minimum: 0
+                      maximum: 32
+                    - type: number
+                    - type: boolean
+                    - type: 'null'
+              examples:
+                - requestedSystem: 'a22c6ad7-ae80-4f5a-a705-7fa63f6e8d0e'
+                  requesterId: 'case.worker@defra.gov.uk'
+                  userIP: '192.168.1.1'
+                  resourceId: '1234567890' # sfd-id-check: allow - resource ID
+                  correlationId: '3a6538ac904b3a2bdf3c4985f85c29c7'
+                - requestedSystem: ''
+                  requesterId: ''
+                  userIP: ''
+                  resourceId: ''
+                  correlationId: ''
+                - {}
+          required:
+            - payment
+            - audit
+      required:
+        - request
+
+    # response objects
+    PaymentsData:
+      type: object
+      properties:
+        $id:
+          description: This object's sequence in the JSON response blob.
+          type: string
+          format: integer
+        Result:
+          type: boolean
+          example: true
+        parmSupplierInfo:
+          type: object
+          properties:
+            $id:
+              description: This object's sequence in the JSON response blob.
+              type: string
+              format: integer
+            parmSupplier:
+              description: The name of the business.
+              type: string
+            parmHoldCodes:
+              description: A list hold codes on the account.
+              type: array
+              items:
+                type: string
+            parmAccountLast4:
+              description: The last 4 digits of the account number, prefixed by 4 asterisks.
+              type: string
+              pattern: '^\*{4}\d{4}$'
+            parmSortCode:
+              description: The 6 digit sort code (NOT dash separated).
+              type: string
+              pattern: '^\d{6}$'
+          additionalProperties: false
+          required:
+            - parmSupplier
+            - parmHoldCodes
+            - parmAccountLast4
+            - parmSortCode
+        parmPayments:
+          description: A list of payments made to the business.
+          type: array
+          items:
+            $ref: '#/components/schemas/Payment'
+        InfoMessages:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+      required:
+        - Result
+        - parmSupplierInfo
+        - parmPayments
+        - InfoMessages
+    Payment:
+      type: object
+      properties:
+        $id:
+          description: This object's sequence in the JSON response blob.
+          type: string
+          format: integer
+        parmPaymentReference:
+          description: The payment reference for this payment transaction.
+          type: string
+          example: 'PY0202826'
+        parmDate:
+          description: The date and time the payment was made.
+          type: string
+          pattern: '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d'
+          example: '2024-03-15T00:00:00'
+        parmAmount:
+          description: The amount paid in this transaction.
+          type: number
+          example: 1500.75
+        parmCurrency:
+          description: The currency of the payment.
+          type: string
+          example: 'GBP'
+        parmLineItems:
+          description: A list of line items included in this payment.
+          type: array
+          items:
+            $ref: '#/components/schemas/PaymentLineItem'
+      additionalProperties: false
+      required:
+        - parmPaymentReference
+        - parmDate
+        - parmAmount
+        - parmCurrency
+        - parmLineItems
+    PaymentLineItem:
+      type: object
+      properties:
+        $id:
+          description: This object's sequence in the JSON response blob.
+          type: string
+          format: integer
+        parmAgreementNumber:
+          description: The agreement number associated with this line item.
+          type: string
+        parmClaimRefNumber:
+          description: The claim reference number associated with this line item.
+          type: string
+        parmScheme:
+          description: The ID of the scheme associated with this line item.
+          type: string
+          example: '10501'
+        parmDescription:
+          description: Description of the line item.
+          type: string
+          example: 'Late claim submission penalty'
+        parmMarketingYear:
+          description: The marketing year associated this line item.
+          type: string
+          format: integer
+          example: '2017'
+        parmAmount:
+          description: The amount for this line item.
+          type: number
+          example: 1161.75
+      required:
+        - parmAgreementNumber
+        - parmClaimRefNumber
+        - parmScheme
+        - parmDescription
+        - parmMarketingYear
+        - parmAmount
+
+    # error responses
+    GenericError:
+      type: object
+      properties:
+        Message:
+          description: Information about the error and its cause.
+          type: string
+          examples:
+            - >
+              An exception occured when deserializing the request
+              - Exception occurred when parsing and deserializing parameter 'request'
+              - 'Parameter 'request' is not found within the request content body.'
+            - >
+              An exception occured when invoking the operation
+              - Object reference not set to an instance of an object.
+        ExceptionType:
+          description: The class name of the error.
+          type: string
+          examples:
+            - XppServicesDeserializationException
+            - NullReferenceException
+        ActivityId:
+          description: A UUID for this error.
+          type: string
+          example: some-long-uuid-string
+    NotFound:
+      type: object
+      properties:
+        $id:
+          description: This object's sequence in the JSON response blob.
+          type: string
+          format: integer
+        Result:
+          type: boolean
+          example: false
+        parmSupplierInfo:
+          type: 'null'
+        parmPayments:
+          description: A list of payments made to the business.
+          type: 'null'
+        InfoMessages:
+          type: array
+          items:
+            type: string
+          examples:
+            - ['*** FRN does not exist', 'No data retrieved for this request']
+            - ['*** No FRN provided', 'No data retrieved for this request']
+      additionalProperties: false
+      required:
+        - Result
+        - parmSupplierInfo
+        - parmPayments
+        - InfoMessages
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
