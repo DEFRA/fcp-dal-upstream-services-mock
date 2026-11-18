@@ -178,22 +178,27 @@ export const staticPersonData = {
   // synthetic replacement for a dev CRM person (real IDs removed)
   9800001: { crn: '9800001000' },
 
+  // DoB edge-case people are all active, as deactivated people never match a duplicate check
   // midsummer birthdays for testing DoB edge cases - UTC timestamps as millis since the epoch
   9000010: {
     crn: '9000001000',
+    deactivated: false,
     dateOfBirth: new Date('2000-06-30T00:00:00Z').getTime()
   },
   9000011: {
     crn: '9000001100',
+    deactivated: false,
     dateOfBirth: new Date('1950-06-01T00:00:00Z').getTime()
   },
   // midwinter birthdays for testing DoB edge cases - UTC timestamps as millis since the epoch
   9000012: {
     crn: '9000001200',
+    deactivated: false,
     dateOfBirth: new Date('2000-01-01T00:00:00Z').getTime()
   },
   9000013: {
     crn: '9000001300',
+    deactivated: false,
     dateOfBirth: new Date('1950-12-31T00:00:00Z').getTime()
   },
 
@@ -201,35 +206,43 @@ export const staticPersonData = {
   // midsummer birthdays for testing DoB edge cases
   9000014: {
     crn: '9000001400',
+    deactivated: false,
     dateOfBirth: new Date('01 Jun 2001 GMT+1').getTime()
   },
   9000015: {
     crn: '9000001500',
+    deactivated: false,
     dateOfBirth: new Date('30 Jun 1940 GMT+3').getTime()
   },
   9000016: {
     crn: '9000001600',
+    deactivated: false,
     dateOfBirth: new Date('01 Jun 2001 GMT-1').getTime()
   },
   9000017: {
     crn: '9000001700',
+    deactivated: false,
     dateOfBirth: new Date('30 Jun 1940 GMT-3').getTime()
   },
   // midwinter birthdays for testing DoB edge cases
   9000018: {
     crn: '9000001800',
+    deactivated: false,
     dateOfBirth: new Date('01 Jan 2001 GMT+3').getTime()
   },
   9000019: {
     crn: '9000001900',
+    deactivated: false,
     dateOfBirth: new Date('31 Dec 1969 GMT+1').getTime()
   },
   9000020: {
     crn: '9000002000',
+    deactivated: false,
     dateOfBirth: new Date('01 Jan 2001 GMT-3').getTime()
   },
   9000021: {
     crn: '9000002100',
+    deactivated: false,
     dateOfBirth: new Date('31 Dec 1969 GMT-1').getTime()
   }
 }

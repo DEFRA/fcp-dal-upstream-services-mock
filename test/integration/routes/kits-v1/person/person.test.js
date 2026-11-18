@@ -413,16 +413,52 @@ describe('Person routes', () => {
       expect(result).toConformToSchema(responseSchema())
     })
 
-    test('should match names case-insensitively and dateOfBirth on the same day', async () => {
+    test('should match names case-insensitively and dateOfBirth on the nearest day', async () => {
       const { result } = await checkDuplicates({
         ...dupe,
         firstName: ' DUPE ',
         lastName: 'check',
-        dateOfBirth: Date.UTC(2003, 9, 4) // a different time on the same day
+        // dupe's dateOfBirth is 2003-10-04T12:26:20.449Z, which rounds to 2003-10-05
+        dateOfBirth: Date.UTC(2003, 9, 5)
       })
 
       expect(result._data.id).toBe(dupeId)
     })
+
+    test.each([
+      ['before midday', '1974-03-05T11:59:59.999Z'],
+      ['at midday the day before', '1974-03-04T12:00:00.000Z'],
+      ['an hour before midnight', '1974-03-04T23:00:00.000Z']
+    ])(
+      'should match a dateOfBirth stored %s to its nearest day',
+      async (_, stored) => {
+        const requested = Date.UTC(1974, 2, 5)
+        const details = {
+          firstName: 'Nearest',
+          lastName: `Day-${stored}`,
+          dateOfBirth: Date.parse(stored),
+          landline: null,
+          mobile: '07700 900002'
+        }
+        const { result: created } = await server.inject({
+          method: 'POST',
+          url: '/person/create',
+          payload: details
+        })
+
+        const { result: match } = await checkDuplicates({
+          ...details,
+          dateOfBirth: requested
+        })
+        const { result: dayBefore } = await checkDuplicates({
+          ...details,
+          dateOfBirth: requested - 24 * 60 * 60 * 1000
+        })
+
+        expect(match._data?.customerReferenceNumber).toBe(created._data)
+        expect(dayBefore._data).toBeNull()
+      }
+    )
 
     test('should not match a deactivated person', async () => {
       const details = {
@@ -457,8 +493,8 @@ describe('Person routes', () => {
     test.each([
       ['a date-time string', '2003-10-04T12:26:20.449Z'],
       [
-        'a date-time string at a different time on the same day',
-        '2003-10-04T00:00:00Z'
+        'a date-time string at a different time on the nearest day',
+        '2003-10-05T00:00:00Z'
       ]
     ])('should match a dateOfBirth given as %s', async (_, dateOfBirth) => {
       const { result } = await checkDuplicates({ ...dupe, dateOfBirth })
@@ -469,7 +505,7 @@ describe('Person routes', () => {
     test('should return dateOfBirth as epoch millis when matched with a date-time string', async () => {
       const { result } = await checkDuplicates({
         ...dupe,
-        dateOfBirth: '2003-10-04T00:00:00Z'
+        dateOfBirth: '2003-10-05T00:00:00Z'
       })
 
       expect(result._data.dateOfBirth).toBe(1065270380449)

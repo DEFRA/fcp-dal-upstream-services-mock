@@ -7,6 +7,7 @@ import {
 } from '../../../src/factories/id-lookups.js'
 import {
   createPerson,
+  findDuplicatePerson,
   retrievePerson,
   searchPeople,
   updatePerson
@@ -208,6 +209,107 @@ describe('person.factory', () => {
       updatePerson(person.id, { email: null })
 
       expect(personIdToDigitalContactPartyId[person.id]).toBeUndefined()
+    })
+  })
+
+  describe('findDuplicatePerson', () => {
+    const day = 24 * 60 * 60 * 1000
+
+    // The DoB edge case people in id-lookups.js, with the calendar day each dateOfBirth represents
+    describe.each([
+      [9000010, 'midsummer, midnight UTC', '2000-06-30'],
+      [9000011, 'midsummer, midnight UTC', '1950-06-01'],
+      [9000012, 'midwinter, midnight UTC', '2000-01-01'],
+      [9000013, 'midwinter, midnight UTC', '1950-12-31'],
+      [9000014, 'midsummer, stored at GMT+1', '2001-06-01'],
+      [9000015, 'midsummer, stored at GMT+3', '1940-06-30'],
+      [9000016, 'midsummer, stored at GMT-1', '2001-06-01'],
+      [9000017, 'midsummer, stored at GMT-3', '1940-06-30'],
+      [9000018, 'midwinter, stored at GMT+3', '2001-01-01'],
+      [9000019, 'midwinter before the epoch, stored at GMT+1', '1969-12-31'],
+      [9000020, 'midwinter, stored at GMT-3', '2001-01-01'],
+      [9000021, 'midwinter before the epoch, stored at GMT-1', '1969-12-31']
+    ])('person %s (%s)', (personId, _, calendarDay) => {
+      const person = retrievePerson(personId)
+      const details = {
+        firstName: person.firstName,
+        lastName: person.lastName,
+        mobile: person.mobile,
+        landline: person.landline
+      }
+      const midnightUtc = Date.parse(`${calendarDay}T00:00:00Z`)
+
+      it.each([
+        ['the stored timestamp', person.dateOfBirth],
+        ['midnight UTC on the day as epoch millis', midnightUtc],
+        ['the day as a date string', calendarDay],
+        [
+          'midnight UTC on the day as a date-time string',
+          `${calendarDay}T00:00:00.000Z`
+        ],
+        [
+          'midday UTC on the day, less a millisecond',
+          midnightUtc + day / 2 - 1
+        ],
+        ['midday UTC the day before', midnightUtc - day / 2],
+        ['midnight in GMT+3 on the day', `${calendarDay}T00:00:00+03:00`],
+        ['midnight in GMT-3 on the day', `${calendarDay}T00:00:00-03:00`]
+      ])('matches a dateOfBirth given as %s', (__, dateOfBirth) => {
+        expect(findDuplicatePerson({ ...details, dateOfBirth })?.id).toBe(
+          person.id
+        )
+      })
+
+      it.each([
+        ['midnight UTC the day before', midnightUtc - day],
+        ['midnight UTC the day after', midnightUtc + day],
+        [
+          'the day before as a date string',
+          new Date(midnightUtc - day).toISOString().slice(0, 10)
+        ],
+        ['midday UTC on the day', midnightUtc + day / 2],
+        [
+          'midday UTC the day before, less a millisecond',
+          midnightUtc - day / 2 - 1
+        ]
+      ])('does not match a dateOfBirth given as %s', (__, dateOfBirth) => {
+        expect(findDuplicatePerson({ ...details, dateOfBirth })?.id).not.toBe(
+          person.id
+        )
+      })
+
+      it('does not match the person against themselves', () => {
+        expect(
+          findDuplicatePerson({
+            ...details,
+            id: person.id,
+            dateOfBirth: person.dateOfBirth
+          })?.id
+        ).not.toBe(person.id)
+      })
+
+      it('does not match when no dateOfBirth is given', () => {
+        expect(findDuplicatePerson(details)?.id).not.toBe(person.id)
+      })
+    })
+
+    it.each([
+      ['an unparseable string', 'not a date'],
+      ['an empty string', ''],
+      ['NaN', Number.NaN],
+      ['a boolean', true],
+      ['an object', {}]
+    ])('matches nobody when dateOfBirth is %s', (_, dateOfBirth) => {
+      const person = retrievePerson(9000010)
+      expect(
+        findDuplicatePerson({
+          firstName: person.firstName,
+          lastName: person.lastName,
+          mobile: person.mobile,
+          landline: person.landline,
+          dateOfBirth
+        })
+      ).toBeUndefined()
     })
   })
 })

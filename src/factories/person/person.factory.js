@@ -169,12 +169,26 @@ export const searchPeople = (searchFieldType, searchPhrase) =>
   personMatchers[searchFieldType](searchPhrase)
 
 const normaliseName = (name) => `${name ?? ''}`.trim().toLowerCase()
+const day = 24 * 60 * 60 * 1000
+/**
+ * Convert a date to its calendar day, as an ISO 8601 date string (YYYY-MM-DD).
+ * Dates of birth are not always stored at midnight UTC, so the date is rounded to the nearest
+ * UTC day, as the DAL does when reading them, rather than truncated, which can give the day before.
+ *
+ * @param {number|string} dateOrMillis - Milliseconds since the epoch, or a date string `Date` can parse
+ * @returns {string|null} The date as YYYY-MM-DD, or null if the value is missing, of another type, or not a valid date
+ * @example
+ * toDateOnly('1990-05-14T23:00:00.000Z') // '1990-05-15'
+ * toDateOnly(null) // null
+ */
 const toDateOnly = (dateOrMillis) => {
   const date = new Date(dateOrMillis)
   return !['number', 'string'].includes(typeof dateOrMillis) ||
     Number.isNaN(date.getTime())
     ? null
-    : date.toISOString().slice(0, 10)
+    : new Date(Math.round(date.getTime() / day) * day)
+        .toISOString()
+        .slice(0, 10)
 }
 
 /**
