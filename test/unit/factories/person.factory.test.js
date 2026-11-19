@@ -213,84 +213,88 @@ describe('person.factory', () => {
   })
 
   describe('findDuplicatePerson', () => {
-    const day = 24 * 60 * 60 * 1000
+    const hour = 60 * 60 * 1000
+    const day = 24 * hour
+    const detailsOf = (personId) => {
+      const { firstName, lastName, mobile, landline } = retrievePerson(personId)
+      return { firstName, lastName, mobile, landline }
+    }
+    const findId = (personId, dateOfBirth) =>
+      findDuplicatePerson({ ...detailsOf(personId), dateOfBirth })?.id
 
-    // The DoB edge case people in id-lookups.js, with the calendar day each dateOfBirth represents
-    describe.each([
+    // The DoB edge case people in id-lookups.js, with the London calendar day each dateOfBirth
+    // falls on (1969 was during British Standard Time, when the UK stayed on GMT+1 all year)
+    it.each([
       [9000010, 'midsummer, midnight UTC', '2000-06-30'],
       [9000011, 'midsummer, midnight UTC', '1950-06-01'],
       [9000012, 'midwinter, midnight UTC', '2000-01-01'],
       [9000013, 'midwinter, midnight UTC', '1950-12-31'],
       [9000014, 'midsummer, stored at GMT+1', '2001-06-01'],
-      [9000015, 'midsummer, stored at GMT+3', '1940-06-30'],
+      [9000015, 'midsummer, stored at GMT+3', '1940-06-29'],
       [9000016, 'midsummer, stored at GMT-1', '2001-06-01'],
       [9000017, 'midsummer, stored at GMT-3', '1940-06-30'],
-      [9000018, 'midwinter, stored at GMT+3', '2001-01-01'],
+      [9000018, 'midwinter, stored at GMT+3', '2000-12-31'],
       [9000019, 'midwinter before the epoch, stored at GMT+1', '1969-12-31'],
       [9000020, 'midwinter, stored at GMT-3', '2001-01-01'],
       [9000021, 'midwinter before the epoch, stored at GMT-1', '1969-12-31']
-    ])('person %s (%s)', (personId, _, calendarDay) => {
-      const person = retrievePerson(personId)
-      const details = {
-        firstName: person.firstName,
-        lastName: person.lastName,
-        mobile: person.mobile,
-        landline: person.landline
+    ])(
+      'matches person %s (%s) on %s in London, and not the days either side',
+      (personId, _, calendarDay) => {
+        const midnightUtc = Date.parse(calendarDay)
+        const dayBefore = new Date(midnightUtc - day).toISOString().slice(0, 10)
+        const dayAfter = new Date(midnightUtc + day).toISOString().slice(0, 10)
+
+        expect(findId(personId, calendarDay)).toBe(personId)
+        expect(findId(personId, dayBefore)).not.toBe(personId)
+        expect(findId(personId, dayAfter)).not.toBe(personId)
       }
-      const midnightUtc = Date.parse(`${calendarDay}T00:00:00Z`)
+    )
+
+    // London's UTC offset in hours on each person's dateOfBirth
+    describe.each([
+      [9000010, 'in BST', '2000-06-30', 1],
+      [9000012, 'in GMT', '2000-01-01', 0]
+    ])('for person %s, born %s', (personId, _, calendarDay, londonOffset) => {
+      const midnightLondon = Date.parse(calendarDay) - londonOffset * hour
 
       it.each([
-        ['the stored timestamp', person.dateOfBirth],
-        ['midnight UTC on the day as epoch millis', midnightUtc],
-        ['the day as a date string', calendarDay],
+        ['midnight London time on the day', midnightLondon, true],
         [
-          'midnight UTC on the day as a date-time string',
-          `${calendarDay}T00:00:00.000Z`
+          'a millisecond before midnight London time the day after',
+          midnightLondon + day - 1,
+          true
         ],
         [
-          'midday UTC on the day, less a millisecond',
-          midnightUtc + day / 2 - 1
+          'a millisecond before midnight London time on the day',
+          midnightLondon - 1,
+          false
         ],
-        ['midday UTC the day before', midnightUtc - day / 2],
-        ['midnight in GMT+3 on the day', `${calendarDay}T00:00:00+03:00`],
-        ['midnight in GMT-3 on the day', `${calendarDay}T00:00:00-03:00`]
-      ])('matches a dateOfBirth given as %s', (__, dateOfBirth) => {
-        expect(findDuplicatePerson({ ...details, dateOfBirth })?.id).toBe(
-          person.id
-        )
-      })
-
-      it.each([
-        ['midnight UTC the day before', midnightUtc - day],
-        ['midnight UTC the day after', midnightUtc + day],
+        ['midnight London time the day after', midnightLondon + day, false],
         [
-          'the day before as a date string',
-          new Date(midnightUtc - day).toISOString().slice(0, 10)
+          'a date-time string with an offset on the day',
+          `${calendarDay}T00:00:00-03:00`,
+          true
         ],
-        ['midday UTC on the day', midnightUtc + day / 2],
         [
-          'midday UTC the day before, less a millisecond',
-          midnightUtc - day / 2 - 1
+          'a date-time string with an offset the day before in London',
+          `${calendarDay}T00:00:00+03:00`,
+          false
         ]
-      ])('does not match a dateOfBirth given as %s', (__, dateOfBirth) => {
-        expect(findDuplicatePerson({ ...details, dateOfBirth })?.id).not.toBe(
-          person.id
-        )
+      ])('given %s, matches: %s', (__, dateOfBirth, matches) => {
+        expect(findId(personId, dateOfBirth) === personId).toBe(matches)
       })
+    })
 
-      it('does not match the person against themselves', () => {
-        expect(
-          findDuplicatePerson({
-            ...details,
-            id: person.id,
-            dateOfBirth: person.dateOfBirth
-          })?.id
-        ).not.toBe(person.id)
-      })
+    it('does not match the person against themselves', () => {
+      const { dateOfBirth } = retrievePerson(9000010)
+      expect(
+        findDuplicatePerson({ ...detailsOf(9000010), id: 9000010, dateOfBirth })
+          ?.id
+      ).not.toBe(9000010)
+    })
 
-      it('does not match when no dateOfBirth is given', () => {
-        expect(findDuplicatePerson(details)?.id).not.toBe(person.id)
-      })
+    it('does not match a person with a dateOfBirth when none is given', () => {
+      expect(findDuplicatePerson(detailsOf(9000010))?.id).not.toBe(9000010)
     })
 
     it.each([
@@ -300,15 +304,8 @@ describe('person.factory', () => {
       ['a boolean', true],
       ['an object', {}]
     ])('matches nobody when dateOfBirth is %s', (_, dateOfBirth) => {
-      const person = retrievePerson(9000010)
       expect(
-        findDuplicatePerson({
-          firstName: person.firstName,
-          lastName: person.lastName,
-          mobile: person.mobile,
-          landline: person.landline,
-          dateOfBirth
-        })
+        findDuplicatePerson({ ...detailsOf(9000010), dateOfBirth })
       ).toBeUndefined()
     })
   })

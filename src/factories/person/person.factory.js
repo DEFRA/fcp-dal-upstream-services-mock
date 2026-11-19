@@ -169,11 +169,18 @@ export const searchPeople = (searchFieldType, searchPhrase) =>
   personMatchers[searchFieldType](searchPhrase)
 
 const normaliseName = (name) => `${name ?? ''}`.trim().toLowerCase()
-const day = 24 * 60 * 60 * 1000
+// en-CA formats dates as YYYY-MM-DD
+const londonDateFormat = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Europe/London',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit'
+})
 /**
- * Convert a date to its calendar day, as an ISO 8601 date string (YYYY-MM-DD).
- * Dates of birth are not always stored at midnight UTC, so the date is rounded to the nearest
- * UTC day, as the DAL does when reading them, rather than truncated, which can give the day before.
+ * Convert a date to its calendar day in London, as an ISO 8601 date string (YYYY-MM-DD).
+ * Dates of birth are often stored as midnight UK time, which is 23:00 UTC the day before during
+ * British Summer Time, so the UTC date would be a day early. A date-only string such as '1990-05-15'
+ * is parsed as midnight UTC, which is always the same day in London.
  *
  * @param {number|string} dateOrMillis - Milliseconds since the epoch, or a date string `Date` can parse
  * @returns {string|null} The date as YYYY-MM-DD, or null if the value is missing, of another type, or not a valid date
@@ -186,9 +193,7 @@ const toDateOnly = (dateOrMillis) => {
   return !['number', 'string'].includes(typeof dateOrMillis) ||
     Number.isNaN(date.getTime())
     ? null
-    : new Date(Math.round(date.getTime() / day) * day)
-        .toISOString()
-        .slice(0, 10)
+    : londonDateFormat.format(date)
 }
 
 /**
