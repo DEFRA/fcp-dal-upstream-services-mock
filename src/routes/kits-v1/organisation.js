@@ -154,11 +154,8 @@ export const organisation = [
     method: 'GET',
     path: '/authorisation/organisation/{organisationId}',
     handler: async (request, h) => {
-      const organisationId = checkOrgIdDigits(request, 'organisationId')
-      // throws a 404 for an unknown org, as upstream does, rather than listing no one
-      retrieveOrganisation(organisationId)
       return h.response({
-        _data: retrieveOrganisationCustomers(organisationId)
+        _data: retrieveOrganisationCustomers(request.params.organisationId)
       })
     }
   },
