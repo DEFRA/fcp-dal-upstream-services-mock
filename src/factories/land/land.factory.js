@@ -51,13 +51,11 @@ const createLand = (orgId) => {
   const parcelDatas = getLandParcels(orgId)
   const parcelsDetailsGeo = parcelDatas.map((parcel) => ({ parcel }))
   const parcels = generateParcels(parcelsDetailsGeo)
-  const covers = parcelDatas.reduce(
-    (result, parcel) => ({
-      ...result,
-      [`${parcel.properties.sheetId}-${parcel.properties.parcelId}`]:
-        parcel.covers ?? []
-    }),
-    {}
+  const covers = Object.fromEntries(
+    parcelDatas.map((parcel) => [
+      `${parcel.properties.sheetId}-${parcel.properties.parcelId}`,
+      parcel.covers ?? []
+    ])
   )
   const coversSummary = generateCoversSummary(Object.values(covers).flat())
 
