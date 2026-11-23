@@ -128,6 +128,60 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApplicationError'
+  /authorisation/organisation/{organisationId}:
+    get:
+      tags:
+        - 'organisation'
+      summary: 'Find the people authorised on an organisation.'
+      description: >
+        Lists the people linked to an organisation, with their role and privileges. A person with
+        more than one role on the organisation is listed once per role.
+      operationId: 'findPeopleByOrganisationId'
+      parameters:
+        - name: 'organisationId'
+          in: 'path'
+          description: >
+            organisationId; upstream only routes 1 to 20 digits (leading zeros are ignored, and
+            values too big for a long are just not found), anything else is blocked by a WAF rule
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9]{1,20}$'
+            examples: ['100000000', '111111111', '222222222'] # sfd-id-check: allow - organisation ID
+      responses:
+        '200':
+          description: 'Returns the people authorised on the organisation.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuthorisedPersonResponse'
+                required:
+                  - '_data'
+                additionalProperties: false
+        '403':
+          description: 'The organisationId is not 1 to 20 digits, so a WAF rule has been triggered.'
+          content:
+            text/html:
+              schema:
+                type: string
+              examples:
+                forbidden:
+                  summary: Forbidden HTML response
+                  value: |
+                    <html><body><h1>403 Forbidden</h1>
+                    Request forbidden by administrative rules.
+                    </body></html>
+        '404':
+          description: 'No organisation has this organisationId.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadRequest'
   /organisation/{organisationId}/lock:
     post:
       tags:
@@ -1021,6 +1075,40 @@ components:
       required:
         - 'id'
         - 'type'
+    AuthorisedPersonResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+          format: int64
+        firstName:
+          type: string
+        lastName:
+          type: string
+        customerReference:
+          type: string
+        confirmed:
+          type: boolean
+        lastUpdatedOn:
+          # note: epoch milliseconds, not the date-time string the v1 spec documents
+          type: integer
+          format: int64
+        role:
+          type: string
+        privileges:
+          type: array
+          items:
+            type: string
+      required:
+        - 'id'
+        - 'firstName'
+        - 'lastName'
+        - 'customerReference'
+        - 'confirmed'
+        - 'lastUpdatedOn'
+        - 'role'
+        - 'privileges'
     AssociatedPersonResponse:
       # NOTE: this data never seems to be populated
       type: object
