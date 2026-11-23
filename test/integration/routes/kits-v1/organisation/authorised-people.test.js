@@ -12,7 +12,7 @@ describe('GET /authorisation/organisation/{organisationId}', () => {
     await server.initialize()
   })
 
-  it('lists the people authorised on an organisation', async () => {
+  it('should list the people authorised on an organisation', async () => {
     // arrange
     const organisationId = '111111111' // sfd-id-check: allow - organisation ID
 
@@ -38,7 +38,7 @@ describe('GET /authorisation/organisation/{organisationId}', () => {
     ])
   })
 
-  it('ignores leading zeros on the organisationId', async () => {
+  it('should ignore leading zeros on the organisationId', async () => {
     // arrange
     const organisationId = '111111111' // sfd-id-check: allow - organisation ID
     const plain = await server.inject({
@@ -61,7 +61,7 @@ describe('GET /authorisation/organisation/{organisationId}', () => {
     ['an unknown organisationId', '999999999'], // sfd-id-check: allow - organisation ID
     ['zero', '0'],
     ['the largest 20 digit value', '99999999999999999999']
-  ])('returns not found for %s', async (_, organisationId) => {
+  ])('should return not found for %s', async (_, organisationId) => {
     // arrange / act
     const { statusCode, payload } = await server.inject({
       method: 'GET',
@@ -84,7 +84,7 @@ describe('GET /authorisation/organisation/{organisationId}', () => {
     ['21 digits', '123456789012345678901'],
     ['trailing letters', '111111111x']
   ])(
-    'blocks %s as forbidden, like the upstream WAF',
+    'should block %s as forbidden, like the upstream WAF',
     async (_, organisationId) => {
       // arrange / act
       const { statusCode, payload } = await server.inject({
