@@ -251,6 +251,25 @@ const validGeometries = JSON.parse(
   // Generated using scripts/generate_geometries.sh
   fs.readFileSync(new URL('./valid-geometries.json', import.meta.url))
 )
+// Number of parcels for the large-geometries org (9300000). Each parcel adds
+// roughly 2.2KB to the /lms/organisation/{organisationId}/geometries response,
+// so this gives a payload of ~50MB for testing large responses.
+const LARGE_GEOMETRIES_PARCEL_COUNT = 23000
+
+// Built deterministically (no faker) so the payload size is stable.
+const generateLargeGeometriesParcels = (count) =>
+  Array.from({ length: count }, (_, i) => ({
+    id: 9300000 + i,
+    properties: {
+      area: String(1000 + (i % 100000) / 10),
+      pendingDigitisation: false,
+      sheetId: `LG${String(Math.floor(i / 10000)).padStart(4, '0')}`,
+      parcelId: String(i % 10000).padStart(4, '0')
+    },
+    geometry: validGeometries[i % validGeometries.length],
+    uses: []
+  }))
+
 // SBI ranges (all SBIs are 9 digits in the 8xxxxxxxx range):
 // - SFD (sfd-test-data): 850000000-869999999
 // - Generated organisations: from 880000001 upwards
@@ -631,6 +650,17 @@ export const orgIdLookup = {
       name: 'Locking Tests',
       locked: false,
       deactivated: false
+    }
+  },
+  // dedicated org for large payload tests: the geometries API returns ~50MB
+  9300000: {
+    sbi: 830000000,
+    customers: [],
+    overrides: {
+      name: 'Large Geometries Holdings'
+    },
+    land: {
+      parcels: generateLargeGeometriesParcels(LARGE_GEOMETRIES_PARCEL_COUNT)
     }
   }
 }
