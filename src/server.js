@@ -5,6 +5,11 @@ import {
   emulateUpstreamErrors,
   failAction
 } from './common/helpers/fail-action.js'
+import {
+  checkExternalGateway,
+  checkInternalGateway,
+  validateKitsProxyConfig
+} from './common/helpers/health/kits-proxy.js'
 import { createLogger } from './common/helpers/logging/logger.js'
 import { requestLogger } from './common/helpers/logging/request-logger.js'
 import { pulse } from './common/helpers/pulse.js'
@@ -61,8 +66,25 @@ export const startServer = async (listener) => {
     ])
     await server.register(hitachiRouter, { routes: { prefix: '/api' } })
     await server.register(kitsRouter, { routes: { prefix: '/extapi' } })
+
     if (config.get('kitsProxy.enabled')) {
+      logger.info('Validating KITS proxy configuration')
+      validateKitsProxyConfig()
+
       await server.register(kitsProxyRouter, { routes: { prefix: '/proxy' } })
+
+      logger.info('Checking internal KITS gateway')
+      await checkInternalGateway(
+        server,
+        config.get('kitsProxy.internal.healthCheckEmail')
+      )
+      logger.info('Internal KITS gateway health check passed')
+
+      logger.info('Checking external KITS gateway')
+      await checkExternalGateway(server)
+      logger.info('External KITS gateway health check passed')
+    } else {
+      logger.info('KITS proxy disabled, skipping gateway health checks')
     }
 
     // emulate upstream error responses
@@ -95,7 +117,6 @@ export const startServer = async (listener) => {
     if (server) {
       await server.stop({ timeout: 0 })
     }
+    throw error
   }
-
-  return server
 }

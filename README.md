@@ -167,6 +167,17 @@ You can then access the proxy as shown in the following example
 
 > curl --header 'x-api-key: {API-KEY}' --header 'email: {EMAIL-ADDRESS}' https://ephemeral-protected.api.dev.cdp-int.defra.cloud/fcp-dal-upstream-services-mock/proxy/internal/extapi/person/3010037/summary
 
+### KITS proxy startup health checks
+
+When the KITS proxy is enabled, the application performs the following checks before starting the server:
+
+1. Validates the required proxy configuration.
+2. Sends a reference-data request through the internal KITS proxy, expecting HTTP 200.
+3. Sends a reference-data request through the external KITS proxy, accepting HTTP 200 or 403.
+
+The internal check requires `KITS_INTERNAL_HEALTHCHECK_EMAIL` to be configured with an authorised service-account email.
+If any check fails, application startup fails. When the KITS proxy is disabled, these checks are skipped.
+
 ### Testing against the external (Defra Identity) upstream
 
 The KITS **external** gateway (used by e.g. the permissions endpoints) authenticates with a Defra Identity token
