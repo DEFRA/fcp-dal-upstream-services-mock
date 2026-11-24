@@ -239,11 +239,13 @@ case "$1" in
     schema="kits-v1/organisation"
     # NOTE: deactivate and reactivate are left out, as generated organisationIds may be real businesses
     export ORG_IDS=$( contract_list "${CONTRACT_ORG_IDS}" )
+    export ORG_ID_STRINGS=$( contract_list "${CONTRACT_ORG_IDS}" string )
     export ORG_SEARCH_SBIS=$( contract_list "${CONTRACT_ORG_SEARCH_SBIS}" string )
     export CONTRACT_ORG_SEARCH_POSTCODE
     mutations='. |
 del(.paths["/organisation/{organisationId}/deactivate"], .paths["/organisation/{organisationId}/reactivate"]) |
 .paths["/organisation/{organisationId}"].get.parameters[0].schema.examples = env(ORG_IDS) |
+.paths["/authorisation/organisation/{organisationId}"].get.parameters[0].schema.examples = env(ORG_ID_STRINGS) |
 .components.schemas.SearchRequestBody.examples[0].primarySearchPhrase = env(ORG_SEARCH_SBIS)[0] |
 .components.schemas.SearchRequestBody.examples[1].primarySearchPhrase = env(ORG_SEARCH_SBIS)[1] |
 .components.schemas.SearchRequestBody.examples[2].primarySearchPhrase = env(ORG_SEARCH_SBIS)[2] |
