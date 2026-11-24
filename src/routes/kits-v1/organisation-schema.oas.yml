@@ -147,7 +147,7 @@ paths:
           schema:
             type: string
             pattern: '^[0-9]{1,20}$'
-            examples: ['100000000', '111111111', '222222222'] # sfd-id-check: allow - organisation ID
+            examples: ['8600001', '8600002', '8600003']
       responses:
         '200':
           description: 'Returns the people authorised on the organisation.'
