@@ -14,7 +14,7 @@ describe('GET /authorisation/organisation/{organisationId}', () => {
 
   it('should list the people authorised on an organisation', async () => {
     // arrange
-    const organisationId = '111111111' // sfd-id-check: allow - organisation ID
+    const organisationId = '8600001'
 
     // act
     const { statusCode, payload } = await server.inject({
@@ -40,7 +40,7 @@ describe('GET /authorisation/organisation/{organisationId}', () => {
 
   it('should ignore leading zeros on the organisationId', async () => {
     // arrange
-    const organisationId = '111111111' // sfd-id-check: allow - organisation ID
+    const organisationId = '8600001'
     const plain = await server.inject({
       method: 'GET',
       url: `/authorisation/organisation/${organisationId}`
@@ -58,7 +58,7 @@ describe('GET /authorisation/organisation/{organisationId}', () => {
   })
 
   it.each([
-    ['an unknown organisationId', '999999999'], // sfd-id-check: allow - organisation ID
+    ['an unknown organisationId', '9999999'],
     ['zero', '0'],
     ['the largest 20 digit value', '99999999999999999999']
   ])('should return not found for %s', async (_, organisationId) => {
