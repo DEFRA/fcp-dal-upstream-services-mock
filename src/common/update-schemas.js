@@ -31,3 +31,18 @@ export const personUpdateSchema = {
   doNotContact: { type: 'boolean', default: false },
   address: addressUpdateSchema
 }
+
+export const organisationUpdateSchema = {
+  name: { type: 'string', default: null },
+  email: { type: 'string', default: null },
+  landline: { type: 'string', default: null },
+  mobile: { type: 'string', default: null },
+  correspondenceEmail: { type: 'string', default: null },
+  correspondenceLandline: { type: 'string', default: null },
+  correspondenceMobile: { type: 'string', default: null },
+  taxRegistrationNumber: { type: 'string', default: null },
+  isFinancialToBusinessAddr: { type: 'boolean', default: null },
+  isCorrespondenceAsBusinessAddr: { type: 'boolean', default: null },
+  address: addressUpdateSchema,
+  correspondenceAddress: addressUpdateSchema
+}
