@@ -6,7 +6,7 @@ describe('Authorisation create & update (Ticket #29)', () => {
 
   beforeAll(async () => {
     process.env = { ...PROCESS_ENV }
-    process.env.PORT = '0' // any free port, so it can't clash with other test files
+    process.env.PORT = '0' // Set to any free port, so it can't clash with other test files
     const { startServer } = await import('../../../../../src/server.js')
     mockServer = await startServer()
   })

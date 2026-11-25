@@ -108,6 +108,13 @@ const config = convict({
         default: null,
         nullable: true,
         env: 'KITS_INTERNAL_GATEWAY_URL'
+      },
+      healthCheckEmail: {
+        doc: 'Service account email for the internal KITS gateway startup health check',
+        format: String,
+        nullable: true,
+        default: null,
+        env: 'KITS_INTERNAL_HEALTHCHECK_EMAIL'
       }
     },
     external: {
