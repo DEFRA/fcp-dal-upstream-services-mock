@@ -21,13 +21,16 @@ export const checkId = (request, idName) => {
   return `${id}`
 }
 
-// Upstream SitiAgri authorisation endpoints reject an `orgId` that is not 1-20 digits with a 403
-// before the payload is read; returns it normalised, as upstream treats `0012` as org 12
-export const checkOrgIdDigits = (request) => {
-  const orgId = `${request?.params?.orgId}`
+// upstream rejects an org id path segment that is not 1-20 digits with a 403 (a waf rule, so before
+// the payload is read); returns it normalised, as upstream treats `0012` as org 12
+export const checkOrgIdDigits = (request, idName = 'orgId') => {
+  const orgId = `${request?.params?.[idName]}`
 
   if (!/^[0-9]{1,20}$/.test(orgId)) {
-    throw Boom.forbidden(`bad orgId: ${orgId}, must be 1-20 digits`, request)
+    throw Boom.forbidden(
+      `bad ${idName}: ${orgId}, must be 1-20 digits`,
+      request
+    )
   }
 
   return BigInt(orgId).toString()
