@@ -4,9 +4,14 @@ services:
     # payload bodies with the forbidden "__proto__" property name!!
     image: schemathesis/schemathesis:4.7.7
     entrypoint: sh
+    environment:
+      SCHEMATHESIS_HOOKS: hooks
     command:
       - -c
       - |
+        echo "Running contract check unit tests"
+        python -m unittest -v test_hooks || exit 1
+
         result=0
         for schema in ${SCHEMAS:-person organisation authenticate siti-agri land bank reference-data permissions internal-user payments email-validation} ; do
           echo "Running contract tests for schema: $${schema}"
@@ -36,3 +41,5 @@ services:
     volumes:
       - ./test/contract/logs:/tmp
       - ./test/contract/schemathesis.toml:/schemathesis.toml:ro
+      - ./test/contract/hooks.py:/app/hooks.py:ro
+      - ./test/contract/test_hooks.py:/app/test_hooks.py:ro
