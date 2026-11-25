@@ -98,6 +98,19 @@ By default, this runs against all schemas. To restrict this to a subset, set the
 SCHEMAS="land bank" npm run test:contract
 ```
 
+### Custom checks
+
+Custom schemathesis checks are defined in [hooks.py](./hooks.py) for constraints that cannot be expressed in OAS.
+
+The `person_update_data_acceptance` check replaces the standard `positive_data_acceptance` check for
+`PUT /person/{personId}`. It expects future dates of birth to be rejected and delegates to the standard check in other
+cases.
+
+This preserves the generated test data and existing test phases.
+
+Unit tests for the custom checks are defined in [test_hooks.py](./test_hooks.py) and run automatically before the local
+mock contract tests.
+
 ### Generated test data
 
 `schemathesis` generates random test data, so by default each run would exercise different inputs.

@@ -410,6 +410,8 @@ if [ "${gateway}" = "kits-internal" ]; then # KITS internal gateway
     docker run --rm --network=host --pull always \
       -v ${baseDir}/tmp:/tmp \
       -v ${baseDir}/schemathesis.toml:/tmp/schemathesis.toml:ro \
+      -v ${baseDir}/hooks.py:/app/hooks.py:ro \
+      -e SCHEMATHESIS_HOOKS=hooks \
       schemathesis/schemathesis:stable \
         --config-file /tmp/schemathesis.toml \
         run /tmp/schema.json \
