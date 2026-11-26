@@ -46,7 +46,7 @@ CONTRACT_ORG_SEARCH_POSTCODE="[POSTCODE]"
 
 ### Organisation operations that write upstream
 
-The `organisation` schema's authorisation, lock and unlock operations write to KITS, so they are only checked when you explicitly define an org, and a person linked to it, for them to use:
+The `organisation` schema's authorisation, lock, unlock and business details operations write to KITS, so they are only checked when you explicitly define an org, and a person linked to it, for them to use:
 
 ```shell
 export CONTRACT_WRITE_ORG_ID=[DISPOSABLE TEST ORG ID]
@@ -55,8 +55,11 @@ test/contract/check-schema.sh organisation
 ```
 
 Without these, the rest of the schema is still checked and the write operations are reported as skipped. When set, the
-run locks and unlocks that org, and overwrites (and may remove) that person's authorisation on it, so check their state
-in RP Gateway before the run and restore it afterwards. The write operations only get schemathesis' examples
+run locks and unlocks that org, overwrites its business details, and overwrites (and may remove) that person's
+authorisation on it, so check their state in RP Gateway before the run and restore it afterwards. The business details
+update uses the name "Contract Test" and clears any field not in the schema's example. It also sends the example's `businessType`,
+which may change the org's. It also changes the email, which
+resets the org's `emailValidated` to false, and that can't be set back through the same endpoint. The write operations only get schemathesis' examples
 phase, in a separate run from the rest of the schema: the coverage, fuzzing and stateful phases would send them other
 IDs, which could lock a real business or link the person to it.
 

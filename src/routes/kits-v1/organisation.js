@@ -61,6 +61,13 @@ const mapOrgToSearchResult = ({
   isCorrespondenceAsBusinessAddr
 })
 
+const validateBusinessDetailsPayload = await createPayloadValidator(
+  'routes/kits-v1/organisation-schema.oas.yml',
+  (schema) =>
+    schema.paths['/organisation/{organisationId}/business-details'].put
+      .requestBody.content['application/json'].schema
+)
+
 const validateLockOrganisationPayload = await createPayloadValidator(
   'routes/kits-v1/organisation-schema.oas.yml',
   (schema) =>
@@ -166,12 +173,42 @@ export const organisation = [
     method: 'PUT',
     path: '/organisation/{organisationId}/business-details',
     handler: async (request, h) => {
-      return h.response({
-        _data: updateOrganisation(
-          request.params.organisationId,
-          request.payload
-        )
-      })
+      const organisationId = checkOrgIdDigits(request, 'organisationId')
+      const body = request.payload
+
+      if (!body) {
+        throw Boom.internal('empty request body')
+      }
+
+      if (typeof body !== 'object' || Array.isArray(body)) {
+        throw Boom.badRequest('request body is not an object', request)
+      }
+
+      // upstream fails without a businessType, before it reports any other missing field
+      if (!body.businessType) {
+        throw Boom.internal('missing businessType')
+      }
+
+      if (!validateBusinessDetailsPayload(body)) {
+        const [{ keyword, instancePath }] =
+          validateBusinessDetailsPayload.errors
+        const message = `invalid business details: ${keyword} ${instancePath}`
+        // upstream only reports some invalid values as bad requests
+        const isServerError =
+          keyword === 'maxLength' ||
+          (keyword === 'pattern' && instancePath === '/email')
+        throw isServerError
+          ? Boom.internal(message)
+          : Boom.badRequest(message, request)
+      }
+
+      try {
+        updateOrganisation(organisationId, body)
+      } catch (e) {
+        // upstream returns a 500, not a 404, for an unknown org
+        throw Boom.internal(e.message)
+      }
+      return h.response().code(204)
     }
   },
   {

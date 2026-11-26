@@ -1,4 +1,9 @@
 import Boom from '@hapi/boom'
+import { organisationUpdateSchema } from '../../common/update-schemas.js'
+import {
+  applyUpdates,
+  defaultObjectFromSchema
+} from '../../utils/applyUpdates.js'
 import {
   fakeAddress,
   fakeIds,
@@ -273,8 +278,28 @@ const generateOrganisation = (orgId, sbi, overrides = {}) => {
 
 export const updateOrganisation = (orgId, updatesToOrg) => {
   const org = retrieveOrganisation(orgId)
-  return Object.assign(org, updatesToOrg)
+  const updates = applyUpdates(
+    organisationUpdateSchema,
+    defaultObjectFromSchema(organisationUpdateSchema),
+    updatesToOrg
+  )
+
+  for (const field of ['address', 'correspondenceAddress']) {
+    updates[field] = updatesToOrg[field]
+      ? {
+          ...updates[field],
+          addressTypeId: updatesToOrg[field].addressTypeId ?? null
+        }
+      : null
+  }
+  updates.taxRegistrationNumber ||= null
+
+  // a changed email has to be validated again, whatever `emailValidated` the update has
+  if (updates.email !== org.email) updates.emailValidated = false
+
+  return Object.assign(org, updates)
 }
+
 export const updateAdditionalOrganisationDetails = (
   orgId,
   {

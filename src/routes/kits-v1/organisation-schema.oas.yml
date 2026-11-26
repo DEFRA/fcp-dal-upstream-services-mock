@@ -182,6 +182,78 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BadRequest'
+  /organisation/{organisationId}/business-details:
+    put:
+      tags:
+        - 'organisation'
+      summary: 'Update business details.'
+      description: >
+        Replaces the business details of an organisation: any updatable field left out of the body is
+        cleared. Other fields (such as `id` and `sbi`) are ignored, so the body may be an organisation
+        as returned by `GET /organisation/{organisationId}`. Changing `email` resets `emailValidated`
+        to false, and it cannot be set back through this endpoint.
+      operationId: 'updateBusinessDetails'
+      parameters:
+        - name: 'organisationId'
+          in: 'path'
+          description: 'organisationId'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [8600001, 8600002]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BusinessDetailsRequest'
+            example:
+              name: 'Contract Test'
+              email: 'contract.test@example.com'
+              landline: '01632960020'
+              businessType:
+                id: 101422
+              address:
+                address1: '1 Contract Test'
+                city: 'TESTVILLE'
+                postalCode: 'TE1 2ST'
+                country: 'United Kingdom'
+      responses:
+        '204':
+          description: 'Business details updated'
+        '400':
+          description: >
+            The body is not a JSON object, or has no name, no phone number, or an invalid
+            taxRegistrationNumber
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadRequest'
+        '403':
+          description: >
+            Updating an organisation is forbidden, or a WAF rule has been triggered (such as by a
+            non-numeric organisationId).
+          content:
+            text/html:
+              schema:
+                type: string
+              examples:
+                forbidden:
+                  summary: Forbidden HTML response
+                  value: |
+                    <html><body><h1>403 Forbidden</h1>
+                    Request forbidden by administrative rules.
+                    </body></html>
+        '500':
+          description: >
+            The organisation does not exist (this is not a 404), the body is empty, there is no
+            businessType, a value is too long, or the email is not valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationError'
   /organisation/{organisationId}/lock:
     post:
       tags:
@@ -838,6 +910,126 @@ components:
           primarySearchPhrase: 'Farm'
         - searchFieldType: 'BUSINESS_POSTCODE'
           primarySearchPhrase: 'AB12 3CD'
+    BusinessDetailsRequest:
+      # NOTE: unknown fields are accepted and ignored
+      # NOTE: constrained strings use oneOf, not a list of types, as schemathesis may otherwise generate
+      # a valid value of another type (such as null) as its over-long value
+      type: object
+      properties:
+        name:
+          # a number is accepted and stored as a string
+          oneOf:
+            - type: string
+              minLength: 1
+              maxLength: 160
+            - type: number
+        email:
+          oneOf:
+            - type: string
+              maxLength: 254
+              pattern: '^$|^[^\s@]+@[^\s@]+$'
+            - type: 'null'
+        landline:
+          oneOf:
+            - type: string
+              maxLength: 50
+            - type: 'null'
+        mobile:
+          oneOf:
+            - type: string
+              maxLength: 50
+            - type: 'null'
+        correspondenceEmail:
+          oneOf:
+            - type: string
+              maxLength: 254
+            - type: 'null'
+        correspondenceLandline:
+          oneOf:
+            - type: string
+              maxLength: 50
+            - type: 'null'
+        correspondenceMobile:
+          oneOf:
+            - type: string
+              maxLength: 50
+            - type: 'null'
+        businessType:
+          # must be present
+          type: object
+          properties:
+            id:
+              type: integer
+          required: ['id']
+        taxRegistrationNumber:
+          description: 'Empty or null clears it'
+          oneOf:
+            - type: string
+              pattern: '^([0-9]{9})?$'
+            - type: 'null'
+        address:
+          $ref: '#/components/schemas/AddressRequest'
+        correspondenceAddress:
+          $ref: '#/components/schemas/AddressRequest'
+        isFinancialToBusinessAddr:
+          type: [boolean, 'null']
+        isCorrespondenceAsBusinessAddr:
+          type: [boolean, 'null']
+      required: ['name', 'businessType']
+      # at least one phone number is needed
+      anyOf:
+        - required: ['landline']
+          properties:
+            landline:
+              type: string
+              minLength: 1
+        - required: ['mobile']
+          properties:
+            mobile:
+              type: string
+              minLength: 1
+    AddressRequest:
+      type: [object, 'null']
+      properties:
+        address1:
+          type: [string, 'null']
+        address2:
+          type: [string, 'null']
+        address3:
+          type: [string, 'null']
+        address4:
+          type: [string, 'null']
+        address5:
+          type: [string, 'null']
+        pafOrganisationName:
+          type: [string, 'null']
+        flatName:
+          type: [string, 'null']
+        buildingNumberRange:
+          type: [string, 'null']
+        buildingName:
+          type: [string, 'null']
+        street:
+          type: [string, 'null']
+        city:
+          type: [string, 'null']
+        county:
+          type: [string, 'null']
+        postalCode:
+          oneOf:
+            - type: string
+              maxLength: 8
+            - type: 'null'
+        country:
+          type: [string, 'null']
+        uprn:
+          type: [string, 'null']
+        dependentLocality:
+          type: [string, 'null']
+        doubleDependentLocality:
+          type: [string, 'null']
+        addressTypeId:
+          type: [integer, 'null']
     LockRequestBody:
       type: object
       examples:
