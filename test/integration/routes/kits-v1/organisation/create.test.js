@@ -1,6 +1,7 @@
 import Hapi from '@hapi/hapi'
 import { emulateUpstreamErrors } from '../../../../../src/common/helpers/fail-action.js'
 import { organisation } from '../../../../../src/routes/kits-v1/organisation.js'
+import { NOT_SPECIFIED_BUSINESS_TYPE_ID } from '../../../../../src/routes/kits-v1/reference-data.js'
 
 // expected responses are what upstream (KITS upgrade) returned for the same kinds of request
 describe('POST /organisation/create/{personId}', () => {
@@ -9,7 +10,7 @@ describe('POST /organisation/create/{personId}', () => {
     name: 'Contract Test Farm',
     businessType: { id: 101404 },
     legalStatus: { id: 102111 },
-    taxRegistrationNumber: '123456789', // sfd-id-check: allow - tax registration number
+    taxRegistrationNumber: '812345678',
     landline: '01632960020',
     email: 'contract.test@example.com',
     address: {
@@ -68,11 +69,11 @@ describe('POST /organisation/create/{personId}', () => {
     [
       'an unknown business type, stored as Not Specified',
       { businessType: { id: 999999 } },
-      { businessType: { id: 101443 } }
+      { businessType: { id: NOT_SPECIFIED_BUSINESS_TYPE_ID } }
     ],
     [
       'a mobile but no landline',
-      { landline: undefined, mobile: '07111222333' },
+      { landline: undefined, mobile: '07700900123' },
       {}
     ],
     ['a uprn only address', { address: { uprn: '910000000002' } }, {}],

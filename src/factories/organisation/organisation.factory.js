@@ -25,7 +25,8 @@ import {
 } from '../id-lookups.js'
 import {
   businessTypes,
-  legalStatuses
+  legalStatuses,
+  NOT_SPECIFIED_BUSINESS_TYPE_ID
 } from '../../routes/kits-v1/reference-data.js'
 import { retrievePerson } from '../person/person.factory.js'
 
@@ -89,6 +90,7 @@ const CANONICAL_PRIVILEGE_NAMES = new Map(
 const organisations = {}
 let startingOrgId = 1000000
 let startingSbi = 880000000
+const SYNTHETIC_FRN_BASE = 9000000000
 
 export const createOrganisation = (personId, payload) => {
   retrievePerson(personId)
@@ -96,14 +98,15 @@ export const createOrganisation = (personId, payload) => {
   startingSbi = generateId(startingSbi, Object.keys(sbiToOrgId).map(Number))
   const id = startingOrgId
   const sbi = startingSbi
-  // upstream assigns the FRN when none is given
-  const businessReference = payload.businessReference ?? `${1100000000 + id}` // sfd-id-check: allow - frn base
+  // upstream assigns the FRN when none is given; the mock uses the synthetic 9xxxxxxxxx range
+  const businessReference =
+    payload.businessReference ?? `${SYNTHETIC_FRN_BASE + id}`
   // upstream stores an unknown business type as Not Specified
   const businessTypeId = businessTypes.some(
     (businessType) => `${businessType.id}` === `${payload.businessType.id}`
   )
     ? Number(payload.businessType.id)
-    : 101443
+    : NOT_SPECIFIED_BUSINESS_TYPE_ID
   const name = payload.name
   const org = {
     id,

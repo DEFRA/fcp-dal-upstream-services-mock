@@ -359,7 +359,7 @@ paths:
                 id: 101404
               legalStatus:
                 id: 102111
-              taxRegistrationNumber: '123456789' # sfd-id-check: allow - tax registration number
+              taxRegistrationNumber: '812345678'
               landline: '01632960020'
               email: 'contract.test@example.com'
               address:
