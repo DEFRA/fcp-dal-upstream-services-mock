@@ -311,7 +311,6 @@ paths:
             type: integer
             format: int32
             minimum: 1
-            maximum: 2147483647 # sfd-id-check: allow - int32 maximum, not an id
         - name: 'page-size'
           in: 'query'
           description: >
@@ -322,7 +321,6 @@ paths:
             type: integer
             format: int32
             minimum: 1
-            maximum: 2147483647 # sfd-id-check: allow - int32 maximum, not an id
             examples: [100, 500]
         - name: 'sort-by'
           in: 'query'

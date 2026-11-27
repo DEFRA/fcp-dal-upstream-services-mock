@@ -155,6 +155,11 @@ const checkPersonId = (request) => checkPathId(request, 'personId')
 const firstQueryValue = (request, name) => [request.query[name]].flat()[0]
 
 const INT32_MAX = 2 ** 31 - 1
+const INT32_MIN = -(2 ** 31)
+
+// upstream defaults
+const DEFAULT_PAGE = 1
+const DEFAULT_PAGE_SIZE = 20
 
 // upstream 404s a page parameter that isn't an int32, and uses the default when it's empty
 const parsePageParam = (request, name, defaultValue) => {
@@ -163,7 +168,7 @@ const parsePageParam = (request, name, defaultValue) => {
     return defaultValue
   }
   const number = Number(value)
-  if (!/^-?\d+$/.test(value) || number > INT32_MAX || number < -INT32_MAX - 1) {
+  if (!/^-?\d+$/.test(value) || number > INT32_MAX || number < INT32_MIN) {
     throw Boom.notFound(`bad ${name}: ${value}`, request)
   }
   return number
@@ -337,8 +342,8 @@ export const person = [
     handler: async (request, h) => {
       const personId = checkPersonId(request)
       // upstream checks these in this order
-      const page = parsePageParam(request, 'page', 1)
-      const size = parsePageParam(request, 'page-size', 20)
+      const page = parsePageParam(request, 'page', DEFAULT_PAGE)
+      const size = parsePageParam(request, 'page-size', DEFAULT_PAGE_SIZE)
       const sortBy = firstQueryValue(request, 'sort-by') || 'name'
       if (!organisationSortKeys[sortBy]) {
         throw Boom.badRequest(`unknown sort-by: ${sortBy}`, request)

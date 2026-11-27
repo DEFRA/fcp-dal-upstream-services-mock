@@ -4,8 +4,11 @@ import { person } from '../../../../../src/routes/kits-v1/person.js'
 
 // expected responses are what upstream (KITS upgrade) returned for the same kinds of request
 describe('GET /organisation/person/{personId}/summary', () => {
-  // linked to 5 organisations, with sbis 860900001 to 860900005
+  // linked to 5 organisations, with these sbis (from the sfd test data)
   const personId = '3011014'
+  const sbis = [860900001, 860900002, 860900003, 860900004, 860900005]
+  // not in the mock data
+  const unknownPersonId = '99999999'
   // linked to 2 organisations with different names
   const namedPersonId = '11111222'
   let server
@@ -52,7 +55,7 @@ describe('GET /organisation/person/{personId}/summary', () => {
     // assert
     expect(statusCode).toBe(200)
     const { _data, _page } = JSON.parse(payload)
-    expect(_data.map(({ sbi }) => sbi)).toEqual([860900005])
+    expect(_data.map(({ sbi }) => sbi)).toEqual([sbis[4]])
     expect(_page).toEqual({
       number: 3,
       size: 2,
@@ -88,11 +91,8 @@ describe('GET /organisation/person/{personId}/summary', () => {
   })
 
   it.each([
-    ['&sort-by=sbi', [860900001, 860900002, 860900003, 860900004, 860900005]],
-    [
-      '&sort-by=sbi&order=desc',
-      [860900005, 860900004, 860900003, 860900002, 860900001]
-    ]
+    ['&sort-by=sbi', sbis],
+    ['&sort-by=sbi&order=desc', sbis.toReversed()]
   ])('should sort by sbi for %j', async (query, expected) => {
     // arrange / act
     const { statusCode, payload } = await summary(`?search=${query}`)
@@ -103,7 +103,7 @@ describe('GET /organisation/person/{personId}/summary', () => {
   })
 
   it.each([
-    ['part of an sbi', '0900003', 1],
+    ['part of an sbi', `${sbis[2]}`.slice(2), 1],
     ['part of the name, in another case', 'CLEAN CON', 5],
     ['the person id', personId, 0],
     ['padding around a word', ' clean ', 0]
@@ -139,11 +139,11 @@ describe('GET /organisation/person/{personId}/summary', () => {
   it.each([
     ['search is missing', '', personId],
     ['search is missing, before page-size', '?page-size=0', personId],
-    ['the person does not exist', '?search=', '99999999'],
+    ['the person does not exist', '?search=', unknownPersonId],
     [
       'the person does not exist, before page-size',
       '?search=&page-size=0',
-      '99999999'
+      unknownPersonId
     ]
   ])('should return a 500 when %s', async (_, query, id) => {
     // arrange / act
@@ -192,7 +192,7 @@ describe('GET /organisation/person/{personId}/summary', () => {
     ['?search=&page-size=0&sort-by=bogus']
   ])('should return a json 400 for %j', async (query) => {
     // arrange / act
-    const { statusCode, payload } = await summary(query, '99999999')
+    const { statusCode, payload } = await summary(query, unknownPersonId)
 
     // assert
     expect(statusCode).toBe(400)
