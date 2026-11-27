@@ -2,6 +2,8 @@
 // so no need for the same level of fakery as the other routes,
 // instead we can just return the same hard coded response as upstream.
 
+export const NOT_SPECIFIED_BUSINESS_TYPE_ID = 101443
+
 export const businessTypes = [
   {
     id: 101402,
@@ -60,7 +62,7 @@ export const businessTypes = [
     type: 'Tourism'
   },
   {
-    id: 101443,
+    id: NOT_SPECIFIED_BUSINESS_TYPE_ID,
     type: 'Not Specified'
   },
   {

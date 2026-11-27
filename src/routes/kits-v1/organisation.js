@@ -75,6 +75,14 @@ const validateAdditionalBusinessDetailsPayload = await createPayloadValidator(
       .put.requestBody.content['application/json'].schema
 )
 
+const validateCreateOrganisationPayload = await createPayloadValidator(
+  'routes/kits-v1/organisation-schema.oas.yml',
+  (schema) =>
+    schema.paths['/organisation/create/{personId}'].post.requestBody.content[
+      'application/json'
+    ].schema
+)
+
 const validateLockOrganisationPayload = await createPayloadValidator(
   'routes/kits-v1/organisation-schema.oas.yml',
   (schema) =>
@@ -254,9 +262,43 @@ export const organisation = [
     method: 'POST',
     path: '/organisation/create/{personId}',
     handler: async (request, h) => {
-      return h.response({
-        _data: createOrganisation(request.params.personId, request.payload)
-      })
+      const personId = checkOrgIdDigits(request, 'personId')
+      const body = request.payload
+
+      if (!body) {
+        throw Boom.internal('empty request body')
+      }
+      if (typeof body !== 'object' || Array.isArray(body)) {
+        throw Boom.badRequest('request body is not an object', request)
+      }
+      if (body.id != null) {
+        throw Boom.badRequest('Malformed data - id should be null', request)
+      }
+      // upstream fails without these, before it reports any other invalid field
+      if (!body.businessType || !body.address) {
+        throw Boom.internal('missing businessType or address')
+      }
+
+      if (!validateCreateOrganisationPayload(body)) {
+        const { errors } = validateCreateOrganisationPayload
+        const message = `invalid organisation: ${JSON.stringify(errors)}`
+        // upstream rejects a long name as a bad request, but fails on other long values and a bad email
+        const isServerError = errors.some(
+          ({ keyword, instancePath }) =>
+            (keyword === 'maxLength' && instancePath !== '/name') ||
+            (keyword === 'pattern' && instancePath === '/email')
+        )
+        throw isServerError
+          ? Boom.internal(message)
+          : Boom.badRequest(message, request)
+      }
+
+      try {
+        return h.response({ _data: createOrganisation(personId, body) })
+      } catch (e) {
+        // upstream returns a 500, not a 404, for an unknown person
+        throw Boom.internal(e.message)
+      }
     }
   },
   {
