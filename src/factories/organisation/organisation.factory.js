@@ -96,6 +96,14 @@ export const createOrganisation = (personId, payload) => {
   startingSbi = generateId(startingSbi, Object.keys(sbiToOrgId).map(Number))
   const id = startingOrgId
   const sbi = startingSbi
+  // upstream assigns the FRN when none is given
+  const businessReference = payload.businessReference ?? `${1100000000 + id}` // sfd-id-check: allow - frn base
+  // upstream stores an unknown business type as Not Specified
+  const businessTypeId = businessTypes.some(
+    (businessType) => `${businessType.id}` === `${payload.businessType.id}`
+  )
+    ? Number(payload.businessType.id)
+    : 101443
   const name = payload.name
   const org = {
     id,
@@ -153,41 +161,43 @@ export const createOrganisation = (personId, payload) => {
           addressTypeId: payload.correspondenceAddress?.addressTypeId ?? null
         }
       : null,
-    isFinancialToBusinessAddr: payload.isFinancialToBusinessAddr,
-    isCorrespondenceAsBusinessAddr: payload.isCorrespondenceAsBusinessAddr,
-    email: payload.email,
-    emailValidated: payload.emailValidated,
-    landline: payload.landline,
-    mobile: payload.mobile,
+    isFinancialToBusinessAddr: payload.isFinancialToBusinessAddr ?? null,
+    isCorrespondenceAsBusinessAddr:
+      payload.isCorrespondenceAsBusinessAddr ?? null,
+    email: payload.email ?? null,
+    emailValidated: false,
+    landline: payload.landline ?? null,
+    mobile: payload.mobile ?? null,
     fax: null,
-    correspondenceEmail: payload.correspondenceEmail,
-    correspondenceEmailValidated: payload.correspondenceEmailValidated,
-    correspondenceLandline: payload.correspondenceLandline,
-    correspondenceMobile: payload.correspondenceMobile,
+    correspondenceEmail: payload.correspondenceEmail ?? null,
+    correspondenceEmailValidated: false,
+    correspondenceLandline: payload.correspondenceLandline ?? null,
+    correspondenceMobile: payload.correspondenceMobile ?? null,
     correspondenceFax: null,
-    taxRegistrationNumber: payload.taxRegistrationNumber,
+    taxRegistrationNumber: payload.taxRegistrationNumber ?? null,
     businessType: {
-      id: payload.businessType.id,
+      id: businessTypeId,
       type: 'Not set'
     },
-    businessReference: payload.businessReference,
-    legalStatus: {
-      id: payload.legalStatus.id,
-      type: 'Not set'
-    },
-    dateStartedFarming: payload.dateStartedFarming,
-    companiesHouseRegistrationNumber: payload.companiesHouseRegistrationNumber,
+    businessReference,
+    legalStatus: payload.legalStatus
+      ? { id: Number(payload.legalStatus.id), type: 'Not set' }
+      : null,
+    dateStartedFarming: payload.dateStartedFarming ?? null,
+    companiesHouseRegistrationNumber:
+      payload.companiesHouseRegistrationNumber ?? null,
     charityCommissionRegistrationNumber:
-      payload.charityCommissionRegistrationNumber,
+      payload.charityCommissionRegistrationNumber ?? null,
     persons: [],
-    hasLandInNorthernIreland: payload.hasLandInNorthernIreland,
-    hasLandInScotland: payload.hasLandInScotland,
-    hasLandInWales: payload.hasLandInWales,
-    hasAdditionalBusinessActivities: payload.hasAdditionalBusinessActivities,
-    vendorNumber: payload.vendorNumber,
-    traderNumber: payload.traderNumber,
+    hasLandInNorthernIreland: payload.hasLandInNorthernIreland ?? null,
+    hasLandInScotland: payload.hasLandInScotland ?? null,
+    hasLandInWales: payload.hasLandInWales ?? null,
+    hasAdditionalBusinessActivities:
+      payload.hasAdditionalBusinessActivities ?? null,
+    vendorNumber: payload.vendorNumber ?? null,
+    traderNumber: payload.traderNumber ?? null,
     isAccountablePeopleDeclarationCompleted:
-      payload.isAccountablePeopleDeclarationCompleted,
+      payload.isAccountablePeopleDeclarationCompleted ?? null,
     additionalBusinessActivities: null
   }
 
@@ -196,8 +206,8 @@ export const createOrganisation = (personId, payload) => {
   orgIdToSbi[id] = sbi
   sbiToOrgId[sbi] = id
   orgIdLookup[id] = { sbi }
-  frnToOrgId[payload.businessReference] = id
-  frnToPaymentOverrides[payload.businessReference] = {}
+  frnToOrgId[businessReference] = id
+  frnToPaymentOverrides[businessReference] = {}
   // the person may not be in any org yet
   personIdToOrgIds[personId] ??= []
   personIdToOrgIds[personId].push(id)

@@ -325,6 +325,90 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApplicationError'
+  /organisation/create/{personId}:
+    post:
+      tags:
+        - 'organisation'
+      summary: 'Create an organisation for a person.'
+      description: >
+        Creates an organisation, linked to the person, and returns it. Upstream assigns the
+        businessReference (FRN) when none is given, and assigns no SBI to an Agency/Agent business. A
+        missing legal status is stored as null, and an unknown business type id as 101443 (Not
+        Specified). Unknown fields are ignored. Every accepted request creates an organisation, which
+        cannot be deleted.
+      operationId: 'createOrganisation'
+      parameters:
+        - name: 'personId'
+          in: 'path'
+          description: 'personId of the person to link the organisation to'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [11111111]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrganisationCreateRequest'
+            example:
+              name: 'Contract Test Farm'
+              businessType:
+                id: 101404
+              legalStatus:
+                id: 102111
+              taxRegistrationNumber: '123456789' # sfd-id-check: allow - tax registration number
+              landline: '01632960020'
+              email: 'contract.test@example.com'
+              address:
+                address1: '1 Contract Test'
+                city: 'TESTVILLE'
+                postalCode: 'TE1 2ST'
+                country: 'United Kingdom'
+      responses:
+        '200':
+          description: 'The created organisation'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    $ref: '#/components/schemas/OrganisationWithAllResponse'
+                required: ['_data']
+        '400':
+          description: >
+            The body is not a JSON object, has an id, or has no or an invalid name, no phone number, an
+            incomplete manual address or an invalid taxRegistrationNumber
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadRequest'
+        '403':
+          description: >
+            Creating an organisation is forbidden, or a WAF rule has been triggered (such as by a
+            non-numeric personId).
+          content:
+            text/html:
+              schema:
+                type: string
+              examples:
+                forbidden:
+                  summary: Forbidden HTML response
+                  value: |
+                    <html><body><h1>403 Forbidden</h1>
+                    Request forbidden by administrative rules.
+                    </body></html>
+        '500':
+          description: >
+            The person does not exist (this is not a 404), the body is empty, there is no businessType or
+            address, a value other than the name is too long, or the email is not valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationError'
   /organisation/{organisationId}/lock:
     post:
       tags:
@@ -981,6 +1065,126 @@ components:
           primarySearchPhrase: 'Farm'
         - searchFieldType: 'BUSINESS_POSTCODE'
           primarySearchPhrase: 'AB12 3CD'
+    OrganisationCreateRequest:
+      # NOTE: unknown fields are accepted and ignored
+      # NOTE: alternatives use oneOf, not a list of types, as schemathesis may otherwise generate a
+      # valid value of another type as its invalid one
+      type: object
+      properties:
+        id:
+          description: 'Must be left out or null'
+          type: 'null'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 160
+        businessType:
+          type: object
+          properties:
+            id:
+              oneOf:
+                - type: integer
+                - type: string
+                  pattern: '^[0-9]+$'
+          required: ['id']
+        legalStatus:
+          oneOf:
+            - type: object
+              properties:
+                id:
+                  oneOf:
+                    - type: integer
+                    - type: string
+                      pattern: '^[0-9]+$'
+              required: ['id']
+            - type: 'null'
+        businessReference:
+          description: 'Assigned upstream when left out'
+          oneOf:
+            - type: string
+            - type: 'null'
+        taxRegistrationNumber:
+          oneOf:
+            - type: string
+              pattern: '^([0-9]{9})?$'
+            - type: 'null'
+        email:
+          oneOf:
+            - type: string
+              maxLength: 254
+              pattern: '^$|^[^\s@]+@[^\s@]+$'
+            - type: 'null'
+        landline:
+          oneOf:
+            - type: string
+              maxLength: 50
+            - type: 'null'
+        mobile:
+          oneOf:
+            - type: string
+              maxLength: 50
+            - type: 'null'
+        correspondenceEmail:
+          oneOf:
+            - type: string
+              maxLength: 254
+            - type: 'null'
+        correspondenceLandline:
+          oneOf:
+            - type: string
+              maxLength: 50
+            - type: 'null'
+        correspondenceMobile:
+          oneOf:
+            - type: string
+              maxLength: 50
+            - type: 'null'
+        address:
+          $ref: '#/components/schemas/CreateAddressRequest'
+        correspondenceAddress:
+          $ref: '#/components/schemas/AddressRequest'
+        isFinancialToBusinessAddr:
+          type: [boolean, 'null']
+        isCorrespondenceAsBusinessAddr:
+          type: [boolean, 'null']
+      required: ['name', 'businessType', 'address']
+      # at least one phone number is needed
+      anyOf:
+        - required: ['landline']
+          properties:
+            landline:
+              type: string
+              minLength: 1
+        - required: ['mobile']
+          properties:
+            mobile:
+              type: string
+              minLength: 1
+    CreateAddressRequest:
+      # either a uprn, or a manual address
+      allOf:
+        - $ref: '#/components/schemas/AddressRequest'
+        - type: object
+          anyOf:
+            - required: ['uprn']
+              properties:
+                uprn:
+                  type: string
+                  minLength: 1
+            - required: ['address1', 'city', 'postalCode', 'country']
+              properties:
+                address1:
+                  type: string
+                  minLength: 1
+                city:
+                  type: string
+                  minLength: 1
+                postalCode:
+                  type: string
+                  minLength: 1
+                country:
+                  type: string
+                  minLength: 1
     AdditionalBusinessDetailsRequest:
       # NOTE: unknown fields are accepted and ignored
       # NOTE: alternatives use oneOf, not a list of types, as schemathesis may otherwise generate a
@@ -1381,7 +1585,8 @@ components:
         id:
           type: integer
         type:
-          type: string
+          # note: the create response has a null legal status type, which a later get fills in
+          type: [string, 'null']
       required:
         - 'id'
         - 'type'
@@ -1472,10 +1677,11 @@ components:
         confirmed:
           type: boolean
         lastUpdatedOn:
-          type: integer
+          # note: null on a new organisation
+          type: [integer, 'null']
           description: 'Timestamp in milliseconds since epoch'
         landConfirmed:
-          type: boolean
+          type: [boolean, 'null']
         deactivated:
           type: boolean
         locked:
@@ -1511,7 +1717,8 @@ components:
         name:
           type: string
         sbi:
-          type: integer
+          # note: null for an Agency/Agent business
+          type: [integer, 'null']
           format: 'int64'
         additionalSbiIds:
           type: array
@@ -1521,10 +1728,11 @@ components:
         confirmed:
           type: boolean
         lastUpdatedOn:
-          type: integer
+          # note: null on a new organisation
+          type: [integer, 'null']
           description: 'Timestamp in milliseconds since epoch'
         landConfirmed:
-          type: boolean
+          type: [boolean, 'null']
         deactivated:
           type: boolean
         locked:
@@ -1578,7 +1786,8 @@ components:
         charityCommissionRegistrationNumber:
           type: [string, 'null']
         persons:
-          type: array
+          # note: null on a new organisation
+          type: [array, 'null']
           items:
             $ref: '#/components/schemas/AssociatedPersonResponse'
         hasLandInNorthernIreland:

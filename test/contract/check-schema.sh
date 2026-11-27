@@ -35,9 +35,10 @@ usage() {
   echo "  h  | help                - show this help message"
   echo
   echo "NOTE: the organisation schema's operations that write upstream (authorisation, lock, unlock,"
-  echo "      business details and additional business details) are only checked when an org and person are explicitly defined in environment variables:"
+  echo "      business details, additional business details and create) are only checked when an org and person are explicitly defined in environment variables:"
   echo "  CONTRACT_WRITE_ORG_ID    - orgId to authorise, lock and unlock, and whose business details and additional business details are overwritten"
-  echo "  CONTRACT_WRITE_PERSON_ID - personId whose authorisation on that org is overwritten"
+  echo "  CONTRACT_WRITE_PERSON_ID - personId whose authorisation on that org is overwritten, and who"
+  echo "                             each run creates a new organisation for"
   echo
   echo "NOTE: the person schema's operations that write upstream (update, lock and unlock) are only"
   echo "      checked when a person is explicitly defined in an environment variable:"
@@ -255,12 +256,13 @@ del(.paths["/organisation/{organisationId}/deactivate"], .paths["/organisation/{
     # own boundary IDs, fuzzing sends random ones and stateful sends real orgIds from other
     # responses, none of which is safe against a real KITS env. Running from docker against the
     # mock is unaffected and all phases will run.
-    write_operations='^(createAuthorisation|updateAuthorisation|removeAuthorisation|lockOrganisation|unlockOrganisation|updateBusinessDetails|updateAdditionalBusinessDetails)$'
+    write_operations='^(createAuthorisation|updateAuthorisation|removeAuthorisation|lockOrganisation|unlockOrganisation|updateBusinessDetails|updateAdditionalBusinessDetails|createOrganisation)$'
     # NOTE: the write operations are only checked when CONTRACT_WRITE_ORG_ID and
     # CONTRACT_WRITE_PERSON_ID are set. The run will lock and unlock that org, overwrite its
     # business details (clearing any not in the example, and resetting emailValidated, which can't be
     # set back with this endpoint), overwrite its additional business details (legal status, business
-    # type, registration numbers and date started farming), and overwrite (and may remove) that person's authorisations on it, so use an org/person that is safe to modify (use RP
+    # type, registration numbers and date started farming), create a new organisation linked to the person
+    # (which cannot be deleted), and overwrite (and may remove) that person's authorisations on it, so use an org/person that is safe to modify (use RP
     # Gateway to verify the state of that org/person before the run, then manually restore that
     # state).
     if [ -n "${CONTRACT_WRITE_ORG_ID}" ] && [ -n "${CONTRACT_WRITE_PERSON_ID}" ]; then
@@ -278,6 +280,7 @@ del(.paths["/organisation/{organisationId}/deactivate"], .paths["/organisation/{
 .paths["/organisation/{organisationId}/unlock"].post.parameters[0].schema.examples = [env(CONTRACT_WRITE_ORG_ID)] |
 .paths["/organisation/{organisationId}/business-details"].put.parameters[0].schema.examples = [env(CONTRACT_WRITE_ORG_ID)] |
 .paths["/organisation/{organisationId}/additional-business-details"].put.parameters[0].schema.examples = [env(CONTRACT_WRITE_ORG_ID)] |
+.paths["/organisation/create/{personId}"].post.parameters[0].schema.examples = [env(CONTRACT_WRITE_PERSON_ID)] |
 '"${authorisation}"'.parameters[0].schema.examples = [strenv(CONTRACT_WRITE_ORG_ID)] |
 '"${authorisation}"'.requestBody.content["application/json"].example = '"${authorisation_body}"' |
 '"${person_authorisation}"'.parameters[0].schema.examples = [strenv(CONTRACT_WRITE_ORG_ID)] |
