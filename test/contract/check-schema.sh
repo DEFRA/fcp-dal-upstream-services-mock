@@ -309,6 +309,7 @@ del(.paths["/organisation/{organisationId}/deactivate"], .paths["/organisation/{
 del(.paths["/person/{personId}/{email}/confirm"], .paths["/verify-email/{digitalContactPartyId}"]) |
 del(.paths["/person/{personId}/deactivate"], .paths["/person/create"]) |
 .paths["/person/{personId}/summary"].get.parameters[0].schema.examples = env(PERSON_IDS) |
+.paths["/organisation/person/{personId}/summary"].get.parameters[0].schema.examples = env(PERSON_IDS) |
 .components.schemas.SearchRequestBody.examples[0].primarySearchPhrase = env(PERSON_SEARCH_CRNS)[0] |
 .components.schemas.SearchRequestBody.examples[1].primarySearchPhrase = env(PERSON_SEARCH_CRNS)[1] |
 .components.schemas.SearchRequestBody.examples[2].primarySearchPhrase = env(PERSON_SEARCH_CRNS)[2] |

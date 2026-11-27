@@ -255,7 +255,7 @@ describe('Basic queries for faked routes', () => {
       // Also check org added to person
       const personOrgs = await mockServer.inject({
         method: 'GET',
-        url: `/extapi/organisation/person/11111111/summary`
+        url: `/extapi/organisation/person/11111111/summary?search=`
       })
 
       expect(personOrgs.statusCode).toBe(200)

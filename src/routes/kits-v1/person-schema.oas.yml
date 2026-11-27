@@ -271,6 +271,125 @@ paths:
           description: 'Person not found'
           $ref: '#/components/responses/NotFound'
 
+  /organisation/person/{personId}/summary:
+    get:
+      tags:
+        - 'person'
+      summary: 'List the organisations a person is linked to'
+      description: >
+        Returns a page of summaries of the organisations the person is linked to, sorted by name
+        (ignoring case) unless `sort-by` says otherwise. Upstream returns a 500 when `search` is
+        missing or the person doesn't exist, so callers always send `search=`.
+      operationId: 'getPersonOrganisationsSummary'
+      parameters:
+        - name: 'personId'
+          in: 'path'
+          description: 'The unique ID of the person.'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [11111111, 11112222, 22222222]
+        - name: 'search'
+          in: 'query'
+          description: >
+            Case-insensitive text to find in the organisation name or SBI. Empty matches every
+            organisation. Required: upstream returns a 500 without it.
+          required: true
+          allowEmptyValue: true
+          schema:
+            type: string
+            examples: ['']
+        - name: 'page'
+          in: 'query'
+          description: >
+            1-based page number, 1 by default. Upstream returns a 500 for a page below 1, or past
+            the last page when there are results, and a 404 for a value that isn't an int32.
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+        - name: 'page-size'
+          in: 'query'
+          description: >
+            Results per page, 20 by default. Upstream returns a 400 (text/plain) below 1, and a 404
+            for a value that isn't an int32.
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            examples: [100, 500]
+        - name: 'sort-by'
+          in: 'query'
+          description: 'Field to sort by, `name` by default. Upstream returns a 400 for any other value.'
+          required: false
+          schema:
+            type: string
+            enum: ['name', 'sbi']
+        - name: 'order'
+          in: 'query'
+          description: 'Ascending when missing, empty or exactly `asc`; any other value sorts descending.'
+          required: false
+          schema:
+            type: string
+            examples: ['asc', 'desc']
+        - name: 'withNotifications'
+          in: 'query'
+          description: >
+            When `true`, each summary also has `unreadNotificationCount` and `readNotificationCount`.
+            Upstream ignores other values.
+          required: false
+          schema:
+            type: string
+            examples: ['true', 'false']
+      responses:
+        '200':
+          description: 'A page of the summaries of the organisations the person is linked to.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  _data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PersonOrganisationSummary'
+                  _page:
+                    $ref: '#/components/schemas/Page'
+                required:
+                  - '_data'
+                  - '_page'
+                additionalProperties: false
+        '400':
+          description: >
+            `sort-by` isn't `name` or `sbi` (JSON), or `page-size` is below 1 (text/plain
+            "Size must be greater than 0").
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: A WAF rule has been triggered, e.g. by a personId that isn't a positive number.
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: '`page` or `page-size` is not an int32.'
+          $ref: '#/components/responses/NotFound'
+        '500':
+          description: >
+            `search` is missing, the person doesn't exist, or `page` is out of range.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 500
+                  message:
+                    type: string
+                    examples:
+                      - 'HTTP 500 Internal Server Error'
+                      - 'There was an error processing your request. It has been logged (ID 704b9f3b19536a35).'
   /person/search:
     post:
       tags:
@@ -1141,6 +1260,50 @@ components:
         totalElements:
           type: integer
           format: 'int64'
+    PersonOrganisationSummary:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+          format: 'int64'
+        name:
+          type: string
+        sbi:
+          # note: null for an Agency/Agent business
+          type: [integer, 'null']
+          format: 'int64'
+        additionalSbiIds:
+          type: array
+          items:
+            type: integer
+        confirmed:
+          type: boolean
+        lastUpdatedOn:
+          type: [integer, 'null']
+          description: 'Timestamp in milliseconds since epoch'
+        landConfirmed:
+          type: [boolean, 'null']
+        deactivated:
+          type: boolean
+        locked:
+          type: boolean
+        unreadNotificationCount:
+          description: 'Only present when `withNotifications=true`'
+          type: integer
+        readNotificationCount:
+          description: 'Only present when `withNotifications=true`'
+          type: integer
+      required:
+        - 'id'
+        - 'name'
+        - 'sbi'
+        - 'additionalSbiIds'
+        - 'confirmed'
+        - 'lastUpdatedOn'
+        - 'landConfirmed'
+        - 'deactivated'
+        - 'locked'
     Address:
       type: object
       additionalProperties: false

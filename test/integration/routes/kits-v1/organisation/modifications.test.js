@@ -82,7 +82,7 @@ describe('Changes to organisation data', () => {
 
       ;({ statusCode, payload } = await mockServer.inject({
         method: 'GET',
-        url: `/extapi/organisation/person/11111111/summary`
+        url: `/extapi/organisation/person/11111111/summary?search=`
       }))
       expect(statusCode).toBe(200)
       expect(JSON.parse(payload)._data).toEqual(
@@ -94,7 +94,7 @@ describe('Changes to organisation data', () => {
       // person 11111121 exists in static data but is not a customer of any organisation
       let { statusCode, payload } = await mockServer.inject({
         method: 'GET',
-        url: `/extapi/organisation/person/11111121/summary`
+        url: `/extapi/organisation/person/11111121/summary?search=`
       })
       expect(statusCode).toBe(200)
       expect(JSON.parse(payload)._data).toEqual([])
@@ -108,7 +108,7 @@ describe('Changes to organisation data', () => {
 
       ;({ statusCode, payload } = await mockServer.inject({
         method: 'GET',
-        url: `/extapi/organisation/person/11111121/summary`
+        url: `/extapi/organisation/person/11111121/summary?search=`
       }))
       expect(statusCode).toBe(200)
       expect(JSON.parse(payload)._data).toEqual([
