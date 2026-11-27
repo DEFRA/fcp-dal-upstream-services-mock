@@ -147,10 +147,10 @@ describe('Changes to organisation data', () => {
         method: 'PUT',
         url: '/extapi/organisation/111111111/additional-business-details', // sfd-id-check: allow - organisation ID
         payload: {
-          legalStatus: { id: 101, type: 'some new value' },
-          businessType: { id: 201, type: 'some new value' },
-          companiesHouseRegistrationNumber: 'new value',
-          charityCommissionRegistrationNumber: 'new value',
+          legalStatus: { id: 102108, type: 'some new value' },
+          businessType: { id: 101404, type: 'some new value' },
+          companiesHouseRegistrationNumber: 'NEW12345',
+          charityCommissionRegistrationNumber: 'NEW1234567',
           dateStartedFarming: '2123-01-01'
         }
       }))
@@ -163,10 +163,10 @@ describe('Changes to organisation data', () => {
       expect(statusCode).toBe(200)
       expect(JSON.parse(payload)._data).toEqual({
         ...org,
-        legalStatus: { id: 101, type: 'some new value' },
-        businessType: { id: 201, type: 'some new value' },
-        companiesHouseRegistrationNumber: 'new value',
-        charityCommissionRegistrationNumber: 'new value',
+        legalStatus: { id: 102108, type: 'some new value' },
+        businessType: { id: 101404, type: 'some new value' },
+        companiesHouseRegistrationNumber: 'NEW12345',
+        charityCommissionRegistrationNumber: 'NEW1234567',
         dateStartedFarming: new Date('2123-01-01T00:00:00.000Z').getTime()
       })
     })
@@ -182,7 +182,7 @@ describe('Changes to organisation data', () => {
       ;({ statusCode, payload } = await mockServer.inject({
         method: 'PUT',
         url: '/extapi/organisation/111111111/additional-business-details', // sfd-id-check: allow - organisation ID
-        payload: { legalStatus: { id: 101 }, businessType: { id: 201 } }
+        payload: { legalStatus: { id: 102108 }, businessType: { id: 101404 } }
       }))
       expect(statusCode).toBe(204)
       expect(payload).toBe('')
@@ -193,8 +193,8 @@ describe('Changes to organisation data', () => {
       expect(statusCode).toBe(200)
       expect(JSON.parse(payload)._data).toEqual({
         ...org,
-        legalStatus: { id: 101, type: 'Set from reference data' },
-        businessType: { id: 201, type: 'Set from reference data' },
+        legalStatus: { id: 102108, type: 'Set from reference data' },
+        businessType: { id: 101404, type: 'Set from reference data' },
         companiesHouseRegistrationNumber: null,
         charityCommissionRegistrationNumber: null,
         dateStartedFarming: null
