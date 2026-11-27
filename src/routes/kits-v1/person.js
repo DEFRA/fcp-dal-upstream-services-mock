@@ -150,6 +150,35 @@ const unableToProcessJson = (h) =>
   h.response({ code: 400, message: 'Unable to process JSON' }).code(400)
 
 const checkPersonId = (request) => checkPathId(request, 'personId')
+
+// a repeated query parameter takes its first value, as upstream does
+const firstQueryValue = (request, name) => [request.query[name]].flat()[0]
+
+const INT32_MAX = 2 ** 31 - 1
+
+// upstream 404s a page parameter that isn't an int32, and uses the default when it's empty
+const parsePageParam = (request, name, defaultValue) => {
+  const value = firstQueryValue(request, name)
+  if (value === undefined || value === '') {
+    return defaultValue
+  }
+  const number = Number(value)
+  if (!/^-?\d+$/.test(value) || number > INT32_MAX || number < -INT32_MAX - 1) {
+    throw Boom.notFound(`bad ${name}: ${value}`, request)
+  }
+  return number
+}
+
+// upstream sorts names ignoring case, and null sbis first
+const organisationSortKeys = {
+  name: (a, b) =>
+    `${a.name}`.toLowerCase().localeCompare(`${b.name}`.toLowerCase()),
+  sbi: (a, b) => (a.sbi ?? -Infinity) - (b.sbi ?? -Infinity)
+}
+
+// not thrown as a Boom error, as emulateUpstreamErrors would replace this body
+const internalServerError = (h) =>
+  h.response({ code: 500, message: 'HTTP 500 Internal Server Error' }).code(500)
 const checkDigitalContactPartyId = (request) =>
   checkPathId(request, 'digitalContactPartyId')
 
@@ -307,16 +336,64 @@ export const person = [
     path: '/organisation/person/{personId}/summary',
     handler: async (request, h) => {
       const personId = checkPersonId(request)
+      // upstream checks these in this order
+      const page = parsePageParam(request, 'page', 1)
+      const size = parsePageParam(request, 'page-size', 20)
+      const sortBy = firstQueryValue(request, 'sort-by') || 'name'
+      if (!organisationSortKeys[sortBy]) {
+        throw Boom.badRequest(`unknown sort-by: ${sortBy}`, request)
+      }
 
+      const search = firstQueryValue(request, 'search')
+      if (search === undefined) {
+        logger.info('search is missing')
+        return internalServerError(h)
+      }
+
+      try {
+        retrievePerson(personId)
+      } catch (error) {
+        if (error.output?.statusCode === 404) {
+          return internalServerError(h)
+        }
+        throw error
+      }
+
+      if (size < 1) {
+        // not thrown as a Boom error, as emulateUpstreamErrors would replace this body
+        return h
+          .response('Size must be greater than 0')
+          .type('text/plain')
+          .code(400)
+      }
+
+      const term = search.toLowerCase()
+      const order = firstQueryValue(request, 'order') || 'asc'
+      const descending = order !== 'asc'
       const orgs = retrievePersonOrgs(personId)
+        .filter(
+          ({ name, sbi }) =>
+            `${name}`.toLowerCase().includes(term) ||
+            (sbi != null && `${sbi}`.includes(term))
+        )
+        .sort(organisationSortKeys[sortBy])
+      if (descending) {
+        orgs.reverse()
+      }
 
+      const totalPages = Math.ceil(orgs.length / size)
+      if (page < 1 || (orgs.length > 0 && page > totalPages)) {
+        throw Boom.internal(`page ${page} is out of range`, request)
+      }
+
+      const data = orgs.slice((page - 1) * size, page * size)
       return h.response({
-        _data: orgs,
+        _data: data,
         _page: {
-          number: 1,
-          size: 500,
-          totalPages: 1,
-          numberOfElements: orgs.length,
+          number: page,
+          size,
+          totalPages,
+          numberOfElements: data.length,
           totalElements: orgs.length
         }
       })

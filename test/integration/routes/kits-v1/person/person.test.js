@@ -343,7 +343,7 @@ describe('Person routes', () => {
   test("should return data for about the specified user's associated organisations", async () => {
     const { result, statusCode } = await server.inject({
       method: 'GET',
-      url: '/organisation/person/11111222/summary'
+      url: '/organisation/person/11111222/summary?search='
     })
     expect(statusCode).toBe(200)
     expect(result._data).toHaveLength(2)
