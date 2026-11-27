@@ -254,6 +254,77 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApplicationError'
+  /organisation/{organisationId}/additional-business-details:
+    put:
+      tags:
+        - 'organisation'
+      summary: 'Update additional business details.'
+      description: >
+        Replaces the legal status, business type, Companies House and Charity Commission numbers and
+        the date started farming of an organisation. The numbers and date are cleared when left out
+        or null, and the numbers also when empty. Other fields are ignored, so the body may be an organisation as returned by
+        `GET /organisation/{organisationId}`. A `type` given with the legal status or business type is
+        ignored upstream, which stores the name from the reference data (the mock stores the given type, or
+        a placeholder).
+      operationId: 'updateAdditionalBusinessDetails'
+      parameters:
+        - name: 'organisationId'
+          in: 'path'
+          description: 'organisationId'
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            examples: [8600001, 8600002]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdditionalBusinessDetailsRequest'
+            example:
+              businessType:
+                id: 101443
+              legalStatus:
+                id: 102111
+              companiesHouseRegistrationNumber: 'CT123456'
+              charityCommissionRegistrationNumber: '1234567'
+              dateStartedFarming: '2020-01-31'
+      responses:
+        '204':
+          description: 'Additional business details updated'
+        '400':
+          description: >
+            The body is empty or not a JSON object, has no legal status or business type id, or has a
+            date started farming that is not a date
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BadRequest'
+        '403':
+          description: >
+            Updating an organisation is forbidden, or a WAF rule has been triggered (such as by a
+            non-numeric organisationId).
+          content:
+            text/html:
+              schema:
+                type: string
+              examples:
+                forbidden:
+                  summary: Forbidden HTML response
+                  value: |
+                    <html><body><h1>403 Forbidden</h1>
+                    Request forbidden by administrative rules.
+                    </body></html>
+        '500':
+          description: >
+            The organisation does not exist (this is not a 404), a legal status or business type id is
+            not in the reference data, or a registration number is too long
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationError'
   /organisation/{organisationId}/lock:
     post:
       tags:
@@ -910,6 +981,53 @@ components:
           primarySearchPhrase: 'Farm'
         - searchFieldType: 'BUSINESS_POSTCODE'
           primarySearchPhrase: 'AB12 3CD'
+    AdditionalBusinessDetailsRequest:
+      # NOTE: unknown fields are accepted and ignored
+      # NOTE: alternatives use oneOf, not a list of types, as schemathesis may otherwise generate a
+      # valid value of another type as its invalid one
+      type: object
+      properties:
+        businessType:
+          $ref: '#/components/schemas/ReferenceIdRequest'
+        legalStatus:
+          $ref: '#/components/schemas/ReferenceIdRequest'
+        companiesHouseRegistrationNumber:
+          oneOf:
+            - type: string
+              maxLength: 8
+            - type: integer
+              minimum: 0
+              maximum: 99999999
+            - type: 'null'
+        charityCommissionRegistrationNumber:
+          oneOf:
+            - type: string
+              maxLength: 10
+            - type: integer
+              minimum: 0
+              maximum: 9999999999
+            - type: 'null'
+        dateStartedFarming:
+          description: 'Stored to the second, and returned as epoch milliseconds'
+          oneOf:
+            - type: string
+              format: date
+            - type: string
+              format: date-time
+            - type: integer
+              description: 'Epoch milliseconds'
+            - type: 'null'
+      required: ['businessType', 'legalStatus']
+    ReferenceIdRequest:
+      type: object
+      properties:
+        id:
+          description: 'An id from the reference data; any other id is a 500'
+          oneOf:
+            - type: integer
+            - type: string
+              pattern: '^[0-9]+$'
+      required: ['id']
     BusinessDetailsRequest:
       # NOTE: unknown fields are accepted and ignored
       # NOTE: constrained strings use oneOf, not a list of types, as schemathesis may otherwise generate
@@ -1452,7 +1570,8 @@ components:
             - $ref: '#/components/schemas/TypeWithId'
             - type: 'null'
         dateStartedFarming:
-          type: [string, 'null']
+          # note: upstream returns epoch milliseconds once set by additional-business-details
+          type: [integer, string, 'null']
           format: 'date-time'
         companiesHouseRegistrationNumber:
           type: [string, 'null']

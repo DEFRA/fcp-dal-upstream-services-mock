@@ -68,6 +68,13 @@ const validateBusinessDetailsPayload = await createPayloadValidator(
       .requestBody.content['application/json'].schema
 )
 
+const validateAdditionalBusinessDetailsPayload = await createPayloadValidator(
+  'routes/kits-v1/organisation-schema.oas.yml',
+  (schema) =>
+    schema.paths['/organisation/{organisationId}/additional-business-details']
+      .put.requestBody.content['application/json'].schema
+)
+
 const validateLockOrganisationPayload = await createPayloadValidator(
   'routes/kits-v1/organisation-schema.oas.yml',
   (schema) =>
@@ -215,34 +222,29 @@ export const organisation = [
     method: 'PUT',
     path: '/organisation/{organisationId}/additional-business-details',
     handler: async (request, h) => {
-      const organisationId = checkId(request, 'organisationId')
+      const organisationId = checkOrgIdDigits(request, 'organisationId')
       const body = request.payload
 
-      if (
-        typeof body !== 'object' ||
-        Array.isArray(body) ||
-        body === null ||
-        // required fields
-        !body.businessType?.id ||
-        !body.legalStatus?.id
-      ) {
-        throw Boom.badRequest(
-          `bad payload: ${body}, expected an object`,
-          request
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw Boom.badRequest('request body is not an object', request)
+      }
+
+      if (!validateAdditionalBusinessDetailsPayload(body)) {
+        const { errors } = validateAdditionalBusinessDetailsPayload
+        const message = `invalid additional business details: ${JSON.stringify(errors)}`
+        // upstream reports a too long registration number as a server error
+        throw errors.some(({ keyword }) =>
+          ['maxLength', 'maximum'].includes(keyword)
         )
+          ? Boom.internal(message)
+          : Boom.badRequest(message, request)
       }
 
       try {
         updateAdditionalOrganisationDetails(organisationId, body)
       } catch (e) {
-        if (e.isBoom) {
-          // 404 is a 500 upstream!!
-          throw Boom.internal(
-            `Organisation with ID: ${organisationId} not found`,
-            request
-          )
-        }
-        throw e
+        // upstream returns a 500, not a 404, for an unknown org or reference data id
+        throw Boom.internal(e.message)
       }
 
       return h.response().code(204)

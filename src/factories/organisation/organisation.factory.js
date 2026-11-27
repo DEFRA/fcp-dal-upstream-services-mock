@@ -23,6 +23,10 @@ import {
   personIdToOrgIds,
   sbiToOrgId
 } from '../id-lookups.js'
+import {
+  businessTypes,
+  legalStatuses
+} from '../../routes/kits-v1/reference-data.js'
 import { retrievePerson } from '../person/person.factory.js'
 
 // All valid privilege names that can be assigned via create/update authorisation.
@@ -300,6 +304,19 @@ export const updateOrganisation = (orgId, updatesToOrg) => {
   return Object.assign(org, updates)
 }
 
+// upstream stores the reference data name as the type; the mock keeps the type it is given, or a
+// placeholder, which consumers' tests rely on
+const referenceItem = (items, { id, type }, name) => {
+  const item = items.find((candidate) => `${candidate.id}` === `${id}`)
+  if (!item) {
+    throw Boom.badRequest(`unknown ${name} id: ${id}`)
+  }
+  return { id: item.id, type: type ?? 'Set from reference data' }
+}
+
+const nullIfEmpty = (value) =>
+  value == null || value === '' ? null : `${value}`
+
 export const updateAdditionalOrganisationDetails = (
   orgId,
   {
@@ -311,22 +328,22 @@ export const updateAdditionalOrganisationDetails = (
   }
 ) => {
   const org = retrieveOrganisation(orgId)
-  const newLegalStatus = {
-    id: legalStatus.id,
-    type: legalStatus.type ?? 'Set from reference data'
+  const updates = {
+    legalStatus: referenceItem(legalStatuses, legalStatus, 'legalStatus'),
+    businessType: referenceItem(businessTypes, businessType, 'businessType'),
+    companiesHouseRegistrationNumber: nullIfEmpty(
+      companiesHouseRegistrationNumber
+    ),
+    charityCommissionRegistrationNumber: nullIfEmpty(
+      charityCommissionRegistrationNumber
+    ),
+    // upstream keeps whole seconds
+    dateStartedFarming:
+      dateStartedFarming == null || dateStartedFarming === ''
+        ? null
+        : Math.floor(new Date(dateStartedFarming).getTime() / 1000) * 1000
   }
-  const newBusinessType = {
-    id: businessType.id,
-    type: businessType.type ?? 'Set from reference data'
-  }
-  Object.assign(org, {
-    legalStatus: newLegalStatus,
-    businessType: newBusinessType,
-    companiesHouseRegistrationNumber: companiesHouseRegistrationNumber ?? null,
-    charityCommissionRegistrationNumber:
-      charityCommissionRegistrationNumber ?? null,
-    dateStartedFarming: new Date(dateStartedFarming).getTime() || null
-  })
+  Object.assign(org, updates)
 }
 
 export const retrieveOrganisation = (orgId) => {
